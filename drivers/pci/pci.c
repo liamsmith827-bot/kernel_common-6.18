@@ -3181,8 +3181,13 @@ EXPORT_SYMBOL_GPL(pci_d3cold_disable);
 
 void pci_pm_power_up_and_verify_state(struct pci_dev *pci_dev)
 {
-	pci_power_up(pci_dev);
+	int ret, state_ret = 1;
+
+	ret = pci_power_up(pci_dev);
 	pci_update_current_state(pci_dev, PCI_D0);
+	trace_android_vh_pci_pm_verify_state(&state_ret, &pci_dev->current_state);
+	if (ret && state_ret)
+		pci_err(pci_dev, "Failed to power up device: %d\n", ret);
 }
 
 /**
