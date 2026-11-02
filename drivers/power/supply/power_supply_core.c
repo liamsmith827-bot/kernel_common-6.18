@@ -713,6 +713,8 @@ static int power_supply_match_device_fwnode_array(struct device *dev,
 	if (*count >= size)
 		return -EOVERFLOW;
 
+	/* The class iterator only holds a temporary device reference. */
+	get_device(dev);
 	psy[*count] = dev_to_psy(dev);
 	atomic_inc(&psy[*count]->use_cnt);
 	(*count)++;
