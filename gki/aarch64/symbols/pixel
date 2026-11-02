@@ -2782,6 +2782,7 @@
   trace_event_reg
   trace_handle_return
   __traceiter_android_rvh_cgroup_force_kthread_migration
+  __traceiter_android_rvh_do_el1_brk
   __traceiter_android_rvh_do_read_fault
   __traceiter_android_rvh_gup_longterm_locked
   __traceiter_android_rvh_hw_protection_shutdown
@@ -2906,6 +2907,7 @@
   __traceiter_workqueue_execute_start
   trace_output_call
   __tracepoint_android_rvh_cgroup_force_kthread_migration
+  __tracepoint_android_rvh_do_el1_brk
   __tracepoint_android_rvh_do_read_fault
   __tracepoint_android_rvh_gup_longterm_locked
   __tracepoint_android_rvh_hw_protection_shutdown
