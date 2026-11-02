@@ -3418,9 +3418,23 @@ static const struct ctl_table vm_compaction[] = {
 	},
 };
 
+static int kcompactd_cpu_online(unsigned int cpu)
+{
+	/* Run after the generic kthread code restores its preferred affinity. */
+	trace_android_vh_mm_kcompactd_cpu_online(cpu);
+	return 0;
+}
+
 static int __init kcompactd_init(void)
 {
-	int nid;
+	int nid, ret;
+
+	if (IS_ENABLED(CONFIG_ANDROID_VENDOR_HOOKS)) {
+		ret = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "mm/kcompactd:online",
+					kcompactd_cpu_online, NULL);
+		if (ret < 0)
+			return ret;
+	}
 
 	for_each_node_state(nid, N_MEMORY)
 		kcompactd_run(nid);
