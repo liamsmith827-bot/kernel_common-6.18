@@ -9,6 +9,11 @@
 
 #include <trace/hooks/vendor_hooks.h>
 
+struct thermal_trip;
+DECLARE_HOOK(android_vh_update_thermal_trip_flag,
+	     TP_PROTO(struct thermal_trip *trip),
+	     TP_ARGS(trip));
+
 DECLARE_HOOK(android_vh_enable_thermal_genl_check,
 	TP_PROTO(int event, int tz_id, int *enable_thermal_genl),
 	TP_ARGS(event, tz_id, enable_thermal_genl));
@@ -21,4 +26,3 @@ DECLARE_HOOK(android_vh_thermal_pm_notify_suspend,
 #endif /* _TRACE_HOOK_THERMAL_H */
 /* This part must be outside protection */
 #include <trace/define_trace.h>
-
