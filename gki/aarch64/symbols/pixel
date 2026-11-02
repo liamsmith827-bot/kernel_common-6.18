@@ -1647,6 +1647,7 @@
   loops_per_jiffy
   lru_cache_disable
   lru_disable_count
+  __lruvec_stat_mod_folio
   LZ4_compress_fast
   LZ4_compress_fast_continue
   LZ4_compress_HC
@@ -2870,6 +2871,7 @@
   __traceiter_android_vh_ufs_update_sysfs
   __traceiter_android_vh_update_thermal_trip_flag
   __traceiter_android_vh_vmscan_kswapd_done
+  __traceiter_clock_set_rate
   __traceiter_cma_alloc_finish
   __traceiter_cma_alloc_start
   __traceiter_cpu_idle
@@ -2995,6 +2997,7 @@
   __tracepoint_android_vh_ufs_update_sysfs
   __tracepoint_android_vh_update_thermal_trip_flag
   __tracepoint_android_vh_vmscan_kswapd_done
+  __tracepoint_clock_set_rate
   __tracepoint_cma_alloc_finish
   __tracepoint_cma_alloc_start
   __tracepoint_cpu_idle
