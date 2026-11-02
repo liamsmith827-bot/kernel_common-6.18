@@ -1962,6 +1962,7 @@
   pci_dev_put
   pci_dev_unlock
   pci_disable_ats
+  pci_d3cold_disable
   pci_disable_device
   pci_disable_msi
   pcie_capability_read_word
