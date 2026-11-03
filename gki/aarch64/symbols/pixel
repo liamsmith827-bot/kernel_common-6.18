@@ -1075,6 +1075,7 @@
   extcon_set_property_sync
   extcon_set_state_sync
   extcon_unregister_notifier
+  fair_sched_class
   fasync_helper
   faux_device_create
   faux_device_destroy
@@ -2802,13 +2803,17 @@
   __traceiter_android_rvh_preempt_enable
   __traceiter_android_rvh_read_swap_cache_async_timeout
   __traceiter_android_rvh_reclaim_folio_list
+  __traceiter_android_rvh_set_iowait
   __traceiter_android_rvh_set_user_nice_locked
+  __traceiter_android_rvh_setscheduler_prio
   __traceiter_android_rvh_swap_read_folio_bdev_sync
   __traceiter_android_rvh_task_fits_cpu
   __traceiter_android_rvh_try_alloc_pages_gfp
   __traceiter_android_rvh_ufs_complete_init
   __traceiter_android_rvh_ufs_reprogram_all_keys
   __traceiter_android_rvh_update_load_sum
+  __traceiter_android_rvh_update_rt_rq_load_avg
+  __traceiter_android_rvh_util_fits_cpu
   __traceiter_android_rvh_vmscan_kswapd_done
   __traceiter_android_rvh_vmscan_kswapd_wake
   __traceiter_android_trigger_vendor_lmk_kill
@@ -2861,6 +2866,7 @@
   __traceiter_android_vh_timerfd_create
   __traceiter_android_vh_tune_swappiness
   __traceiter_android_vh_typec_tcpm_log
+  __traceiter_android_vh_uclamp_validate
   __traceiter_android_vh_ufs_check_int_errors
   __traceiter_android_vh_ufs_compl_command
   __traceiter_android_vh_ufs_eh_timed_out
@@ -2929,13 +2935,17 @@
   __tracepoint_android_rvh_preempt_enable
   __tracepoint_android_rvh_read_swap_cache_async_timeout
   __tracepoint_android_rvh_reclaim_folio_list
+  __tracepoint_android_rvh_set_iowait
   __tracepoint_android_rvh_set_user_nice_locked
+  __tracepoint_android_rvh_setscheduler_prio
   __tracepoint_android_rvh_swap_read_folio_bdev_sync
   __tracepoint_android_rvh_task_fits_cpu
   __tracepoint_android_rvh_try_alloc_pages_gfp
   __tracepoint_android_rvh_ufs_complete_init
   __tracepoint_android_rvh_ufs_reprogram_all_keys
   __tracepoint_android_rvh_update_load_sum
+  __tracepoint_android_rvh_update_rt_rq_load_avg
+  __tracepoint_android_rvh_util_fits_cpu
   __tracepoint_android_rvh_vmscan_kswapd_done
   __tracepoint_android_rvh_vmscan_kswapd_wake
   __tracepoint_android_trigger_vendor_lmk_kill
@@ -2988,6 +2998,7 @@
   __tracepoint_android_vh_timerfd_create
   __tracepoint_android_vh_tune_swappiness
   __tracepoint_android_vh_typec_tcpm_log
+  __tracepoint_android_vh_uclamp_validate
   __tracepoint_android_vh_ufs_check_int_errors
   __tracepoint_android_vh_ufs_compl_command
   __tracepoint_android_vh_ufs_eh_timed_out
