@@ -326,6 +326,8 @@ struct power_supply_ext {
 				     enum power_supply_property psp);
 };
 
+struct power_supply_lifetime;
+
 struct power_supply {
 	const struct power_supply_desc *desc;
 
@@ -364,7 +366,7 @@ struct power_supply {
 	struct led_trigger *charging_orange_full_green_trig;
 #endif
 
-	ANDROID_KABI_RESERVE(1);
+	ANDROID_KABI_USE(1, struct power_supply_lifetime *lifetime);
 };
 
 #define dev_to_psy(__dev)	container_of_const(__dev, struct power_supply, dev)

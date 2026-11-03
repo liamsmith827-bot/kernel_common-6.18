@@ -20,6 +20,7 @@
 #include <linux/err.h>
 #include <linux/power_supply.h>
 #include <linux/property.h>
+#include <linux/srcu.h>
 #include <linux/thermal.h>
 #include <linux/fixp-arith.h>
 #include "power_supply.h"
@@ -45,6 +46,59 @@ struct match_fwnode_array_param {
 };
 
 #define POWER_SUPPLY_DEFERRED_REGISTER_TIME	msecs_to_jiffies(10)
+
+struct power_supply_lifetime {
+	struct srcu_struct callbacks;
+	struct lock_class_key key;
+};
+
+static int power_supply_lifetime_init(struct power_supply *psy)
+{
+	struct power_supply_lifetime *lifetime;
+	int ret;
+
+	lifetime = kzalloc(sizeof(*lifetime), GFP_KERNEL);
+	if (!lifetime)
+		return -ENOMEM;
+
+	lockdep_register_key(&lifetime->key);
+	ret = init_srcu_struct(&lifetime->callbacks);
+	if (ret) {
+		lockdep_unregister_key(&lifetime->key);
+		kfree(lifetime);
+		return ret;
+	}
+	lockdep_set_class(&lifetime->callbacks, &lifetime->key);
+	psy->lifetime = lifetime;
+	return 0;
+}
+
+static void power_supply_lifetime_free(struct power_supply *psy)
+{
+	struct power_supply_lifetime *lifetime = psy->lifetime;
+
+	cleanup_srcu_struct(&lifetime->callbacks);
+	lockdep_unregister_key(&lifetime->key);
+	kfree(lifetime);
+}
+
+static bool power_supply_available(struct power_supply *psy)
+{
+	return smp_load_acquire(&psy->initialized) && !READ_ONCE(psy->removing);
+}
+
+static void power_supply_stop(struct power_supply *psy)
+{
+	unsigned long flags;
+
+	/* Bridge change-event admission and queuing against the final work drain. */
+	spin_lock_irqsave(&psy->changed_lock, flags);
+	WRITE_ONCE(psy->removing, true);
+	spin_unlock_irqrestore(&psy->changed_lock, flags);
+	synchronize_srcu(&psy->lifetime->callbacks);
+	cancel_delayed_work_sync(&psy->deferred_register_work);
+	cancel_work_sync(&psy->changed_work);
+}
 
 static bool __power_supply_is_supplied_by(struct power_supply *supplier,
 					 struct power_supply *supply)
@@ -140,6 +194,9 @@ static int psy_for_each_psy_cb(struct device *dev, void *data)
 	struct psy_for_each_psy_cb_data *cb_data = data;
 	struct power_supply *psy = dev_to_psy(dev);
 
+	if (!power_supply_available(psy))
+		return 0;
+
 	return cb_data->fn(psy, cb_data->data);
 }
 
@@ -161,10 +218,12 @@ void power_supply_changed(struct power_supply *psy)
 	dev_dbg(&psy->dev, "%s\n", __func__);
 
 	spin_lock_irqsave(&psy->changed_lock, flags);
-	psy->changed = true;
-	pm_stay_awake(&psy->dev);
+	if (!psy->removing) {
+		psy->changed = true;
+		pm_stay_awake(&psy->dev);
+		schedule_work(&psy->changed_work);
+	}
 	spin_unlock_irqrestore(&psy->changed_lock, flags);
-	schedule_work(&psy->changed_work);
 }
 EXPORT_SYMBOL_GPL(power_supply_changed);
 
@@ -185,7 +244,7 @@ static void power_supply_deferred_register_work(struct work_struct *work)
 
 	if (psy->dev.parent) {
 		while (!device_trylock(psy->dev.parent)) {
-			if (psy->removing)
+			if (READ_ONCE(psy->removing))
 				return;
 			msleep(10);
 		}
@@ -351,6 +410,10 @@ static int __power_supply_am_i_supplied(struct power_supply *epsy, void *_data)
 	union power_supply_propval ret = {0,};
 	struct psy_am_i_supplied_data *data = _data;
 
+	guard(srcu)(&epsy->lifetime->callbacks);
+	if (!power_supply_available(epsy))
+		return 0;
+
 	if (__power_supply_is_supplied_by(epsy, data->psy)) {
 		data->count++;
 		if (!epsy->desc->get_property(epsy, POWER_SUPPLY_PROP_ONLINE,
@@ -381,6 +444,10 @@ static int __power_supply_is_system_supplied(struct power_supply *psy, void *dat
 {
 	union power_supply_propval ret = {0,};
 	unsigned int *count = data;
+
+	guard(srcu)(&psy->lifetime->callbacks);
+	if (!power_supply_available(psy))
+		return 0;
 
 	if (!psy->desc->get_property(psy, POWER_SUPPLY_PROP_SCOPE, &ret))
 		if (ret.intval == POWER_SUPPLY_SCOPE_DEVICE)
@@ -460,6 +527,10 @@ static int power_supply_match_device_by_name(struct device *dev, const void *dat
 	const char *name = data;
 	struct power_supply *psy = dev_to_psy(dev);
 
+	guard(srcu)(&psy->lifetime->callbacks);
+	if (!power_supply_available(psy))
+		return 0;
+
 	return strcmp(psy->desc->name, name) == 0;
 }
 
@@ -492,6 +563,10 @@ EXPORT_SYMBOL_GPL(power_supply_get_by_name);
 static bool power_supply_is_system_battery(struct power_supply *psy)
 {
 	union power_supply_propval val;
+
+	guard(srcu)(&psy->lifetime->callbacks);
+	if (!power_supply_available(psy))
+		return false;
 
 	if (psy->desc->type != POWER_SUPPLY_TYPE_BATTERY)
 		return false;
@@ -658,7 +733,8 @@ EXPORT_SYMBOL_GPL(power_supply_put);
 
 static int power_supply_match_device_fwnode(struct device *dev, const void *data)
 {
-	return dev->parent && dev_fwnode(dev->parent) == data;
+	return power_supply_available(dev_to_psy(dev)) && dev->parent &&
+		dev_fwnode(dev->parent) == data;
 }
 
 /**
@@ -706,6 +782,9 @@ static int power_supply_match_device_fwnode_array(struct device *dev,
 	struct power_supply **psy = param->psy;
 	ssize_t size = param->psy_size;
 	ssize_t *count = &param->psy_count;
+
+	if (!power_supply_available(dev_to_psy(dev)))
+		return 0;
 
 	if (!dev->parent || dev_fwnode(dev->parent) != param->parent_fwnode)
 		return 0;
@@ -1479,11 +1558,13 @@ static int __power_supply_get_property(struct power_supply *psy, enum power_supp
 {
 	struct power_supply_ext_registration *reg;
 
-	if (atomic_read(&psy->use_cnt) <= 0) {
-		if (!psy->initialized)
-			return -EAGAIN;
+	guard(srcu)(&psy->lifetime->callbacks);
+	if (READ_ONCE(psy->removing))
 		return -ENODEV;
-	}
+	if (!smp_load_acquire(&psy->initialized))
+		return -EAGAIN;
+	if (atomic_read(&psy->use_cnt) <= 0)
+		return -ENODEV;
 
 	if (use_extensions) {
 		scoped_guard(rwsem_read, &psy->extensions_sem) {
@@ -1537,7 +1618,8 @@ static int __power_supply_set_property(struct power_supply *psy, enum power_supp
 {
 	struct power_supply_ext_registration *reg;
 
-	if (atomic_read(&psy->use_cnt) <= 0)
+	guard(srcu)(&psy->lifetime->callbacks);
+	if (!power_supply_available(psy) || atomic_read(&psy->use_cnt) <= 0)
 		return -ENODEV;
 
 	if (use_extensions) {
@@ -1593,6 +1675,11 @@ int power_supply_property_is_writeable(struct power_supply *psy,
 {
 	struct power_supply_ext_registration *reg;
 
+	/* This callback also supplies attribute permissions during device_add(). */
+	guard(srcu)(&psy->lifetime->callbacks);
+	if (READ_ONCE(psy->removing))
+		return 0;
+
 	power_supply_for_each_extension(reg, psy) {
 		if (power_supply_ext_has_property(reg->ext, psp)) {
 			if (reg->ext->property_is_writeable)
@@ -1611,7 +1698,8 @@ int power_supply_property_is_writeable(struct power_supply *psy,
 
 void power_supply_external_power_changed(struct power_supply *psy)
 {
-	if (atomic_read(&psy->use_cnt) <= 0 ||
+	guard(srcu)(&psy->lifetime->callbacks);
+	if (!power_supply_available(psy) || atomic_read(&psy->use_cnt) <= 0 ||
 			!psy->desc->external_power_changed)
 		return;
 
@@ -1712,6 +1800,7 @@ static void power_supply_dev_release(struct device *dev)
 	struct power_supply *psy = to_power_supply(dev);
 
 	dev_dbg(dev, "%s\n", __func__);
+	power_supply_lifetime_free(psy);
 	kfree(psy);
 }
 
@@ -1815,6 +1904,18 @@ __power_supply_register(struct device *parent,
 	if (!psy)
 		return ERR_PTR(-ENOMEM);
 
+	rc = power_supply_lifetime_init(psy);
+	if (rc) {
+		kfree(psy);
+		return ERR_PTR(rc);
+	}
+	spin_lock_init(&psy->changed_lock);
+	init_rwsem(&psy->extensions_sem);
+	INIT_LIST_HEAD(&psy->extensions);
+	INIT_WORK(&psy->changed_work, power_supply_changed_work);
+	INIT_DELAYED_WORK(&psy->deferred_register_work,
+			  power_supply_deferred_register_work);
+
 	dev = &psy->dev;
 
 	device_initialize(dev);
@@ -1837,10 +1938,6 @@ __power_supply_register(struct device *parent,
 	if (rc)
 		goto dev_set_name_failed;
 
-	INIT_WORK(&psy->changed_work, power_supply_changed_work);
-	INIT_DELAYED_WORK(&psy->deferred_register_work,
-			  power_supply_deferred_register_work);
-
 	rc = power_supply_check_supplies(psy);
 	if (rc) {
 		dev_dbg(dev, "Not all required supplies found, defer probe\n");
@@ -1857,10 +1954,6 @@ __power_supply_register(struct device *parent,
 		if (rc && rc != -ENODEV && rc != -ENOENT)
 			goto check_supplies_failed;
 	}
-
-	spin_lock_init(&psy->changed_lock);
-	init_rwsem(&psy->extensions_sem);
-	INIT_LIST_HEAD(&psy->extensions);
 
 	rc = device_add(dev);
 	if (rc)
@@ -1894,7 +1987,7 @@ __power_supply_register(struct device *parent,
 	 *    after calling power_supply_register()).
 	 */
 	atomic_inc(&psy->use_cnt);
-	psy->initialized = true;
+	smp_store_release(&psy->initialized, true);
 
 	queue_delayed_work(system_power_efficient_wq,
 			   &psy->deferred_register_work,
@@ -1912,6 +2005,7 @@ wakeup_init_failed:
 device_add_failed:
 check_supplies_failed:
 dev_set_name_failed:
+	power_supply_stop(psy);
 	put_device(dev);
 	return ERR_PTR(rc);
 }
@@ -1987,13 +2081,14 @@ EXPORT_SYMBOL_GPL(devm_power_supply_register);
  *
  * Remove this power supply from the system. The resources of power supply
  * will be freed here or on last power_supply_put() call.
+ * Descriptor callbacks are joined before returning. Do not unregister from a
+ * callback, or while holding a lock needed by a callback. Drivers must still
+ * stop their own producers and keep descriptor metadata valid for its lifetime.
  */
 void power_supply_unregister(struct power_supply *psy)
 {
 	WARN_ON(atomic_dec_return(&psy->use_cnt));
-	psy->removing = true;
-	cancel_work_sync(&psy->changed_work);
-	cancel_delayed_work_sync(&psy->deferred_register_work);
+	power_supply_stop(psy);
 	sysfs_remove_link(&psy->dev.kobj, "powers");
 	power_supply_remove_hwmon_sysfs(psy);
 	power_supply_remove_triggers(psy);
