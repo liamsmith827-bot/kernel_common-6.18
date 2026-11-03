@@ -2814,6 +2814,7 @@
   __traceiter_android_trigger_vendor_lmk_kill
   __traceiter_android_vh_adjust_kvmalloc_flags
   __traceiter_android_vh_alter_futex_plist_add
+  __traceiter_android_vh_binder_looper_state_registered
   __traceiter_android_vh_calc_alloc_flags
   __traceiter_android_vh_calculate_totalreserve_pages
   __traceiter_android_vh_check_new_page
@@ -2940,6 +2941,7 @@
   __tracepoint_android_trigger_vendor_lmk_kill
   __tracepoint_android_vh_adjust_kvmalloc_flags
   __tracepoint_android_vh_alter_futex_plist_add
+  __tracepoint_android_vh_binder_looper_state_registered
   __tracepoint_android_vh_calc_alloc_flags
   __tracepoint_android_vh_calculate_totalreserve_pages
   __tracepoint_android_vh_check_new_page

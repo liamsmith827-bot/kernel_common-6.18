@@ -71,6 +71,9 @@ DECLARE_HOOK(android_vh_binder_ioctl_end,
 		struct binder_proc *proc,
 		int *ret),
 	TP_ARGS(caller_task, cmd, arg, thread, proc, ret));
+DECLARE_HOOK(android_vh_binder_looper_state_registered,
+	TP_PROTO(struct binder_thread *thread, struct binder_proc *proc),
+	TP_ARGS(thread, proc));
 DECLARE_HOOK(android_vh_binder_looper_exited,
 	TP_PROTO(struct binder_thread *thread, struct binder_proc *proc),
 	TP_ARGS(thread, proc));
