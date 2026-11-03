@@ -564,9 +564,10 @@ static void pci_pm_default_resume(struct pci_dev *pci_dev)
 
 static void pci_pm_default_resume_early(struct pci_dev *pci_dev)
 {
-	pci_pm_power_up_and_verify_state(pci_dev);
-	pci_restore_state(pci_dev);
-	pci_pme_restore(pci_dev);
+	if (!pci_pm_power_up_and_verify_state(pci_dev)) {
+		pci_restore_state(pci_dev);
+		pci_pme_restore(pci_dev);
+	}
 }
 
 static void pci_pm_bridge_power_up_actions(struct pci_dev *pci_dev)
@@ -1112,8 +1113,8 @@ static int pci_pm_thaw_noirq(struct device *dev)
 	 * in case the driver's "freeze" callbacks put it into a low-power
 	 * state.
 	 */
-	pci_pm_power_up_and_verify_state(pci_dev);
-	pci_restore_state(pci_dev);
+	if (!pci_pm_power_up_and_verify_state(pci_dev))
+		pci_restore_state(pci_dev);
 
 	if (pci_has_legacy_pm_support(pci_dev))
 		return 0;

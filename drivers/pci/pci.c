@@ -3179,15 +3179,20 @@ void pci_d3cold_disable(struct pci_dev *dev)
 }
 EXPORT_SYMBOL_GPL(pci_d3cold_disable);
 
-void pci_pm_power_up_and_verify_state(struct pci_dev *pci_dev)
+int pci_pm_power_up_and_verify_state(struct pci_dev *pci_dev)
 {
-	int ret, state_ret = 1;
+	int ret, state_ret = 0;
 
 	ret = pci_power_up(pci_dev);
 	pci_update_current_state(pci_dev, PCI_D0);
 	trace_android_vh_pci_pm_verify_state(&state_ret, &pci_dev->current_state);
-	if (ret && state_ret)
+	/* A positive return requests BAR restoration after a successful power-up. */
+	if (ret < 0 && state_ret) {
 		pci_err(pci_dev, "Failed to power up device: %d\n", ret);
+		return ret;
+	}
+
+	return 0;
 }
 
 /**
