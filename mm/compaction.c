@@ -2549,7 +2549,7 @@ compact_zone(struct compact_control *cc, struct capture_control *capc)
 	bool update_cached;
 	unsigned int nr_succeeded = 0, nr_migratepages;
 	int order;
-	long vendor_ret;
+	long vendor_ret = 0;
 
 	/*
 	 * These counters track activities during zone compaction.  Initialize
