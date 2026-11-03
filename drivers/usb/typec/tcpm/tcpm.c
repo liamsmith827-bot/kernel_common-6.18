@@ -23,6 +23,7 @@
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/srcu.h>
 #include <linux/string_choices.h>
 #include <linux/usb.h>
 #include <linux/usb/pd.h>
@@ -714,6 +715,75 @@ struct tcpm_port {
 	u8 *logbuffer[LOG_BUFFER_ENTRIES];
 #endif
 };
+
+/* Keep lifetime state outside the port layout used by exported TCPM APIs. */
+struct tcpm_port_owner {
+	struct tcpm_port port;
+	struct srcu_struct callbacks;
+	struct lock_class_key callback_key;
+	raw_spinlock_t work_lock;
+	bool callbacks_ready;
+	bool callbacks_retired;
+	bool work_stopped;
+};
+
+static struct tcpm_port_owner *tcpm_owner(struct tcpm_port *port)
+{
+	return container_of(port, struct tcpm_port_owner, port);
+}
+
+/* Call with callbacks held; the caller must already own the port allocation. */
+static int tcpm_callback_status(struct tcpm_port *port)
+{
+	struct tcpm_port_owner *owner = tcpm_owner(port);
+
+	if (READ_ONCE(owner->callbacks_retired))
+		return -ENODEV;
+	return smp_load_acquire(&owner->callbacks_ready) ? 0 : -EAGAIN;
+}
+
+static void tcpm_callbacks_cleanup(void *data)
+{
+	struct tcpm_port_owner *owner = data;
+
+	/* The later managed power supply has already unregistered and joined. */
+	cleanup_srcu_struct(&owner->callbacks);
+	lockdep_unregister_key(&owner->callback_key);
+}
+
+static bool tcpm_queue_work(struct tcpm_port *port, struct kthread_work *work)
+{
+	struct tcpm_port_owner *owner = tcpm_owner(port);
+	unsigned long flags;
+	bool queued = false;
+
+	raw_spin_lock_irqsave(&owner->work_lock, flags);
+	if (!owner->work_stopped)
+		queued = kthread_queue_work(port->wq, work);
+	raw_spin_unlock_irqrestore(&owner->work_lock, flags);
+	return queued;
+}
+
+static void tcpm_stop_worker(struct tcpm_port *port)
+{
+	struct tcpm_port_owner *owner = tcpm_owner(port);
+	unsigned long flags;
+
+	/* Admitted requests may need the worker to finish their bounded waits. */
+	WRITE_ONCE(owner->callbacks_retired, true);
+	synchronize_srcu(&owner->callbacks);
+	raw_spin_lock_irqsave(&owner->work_lock, flags);
+	owner->work_stopped = true;
+	WRITE_ONCE(port->registered, false);
+	raw_spin_unlock_irqrestore(&owner->work_lock, flags);
+
+	/* Neither callbacks nor draining work can start timers or queue again. */
+	hrtimer_cancel(&port->send_discover_timer);
+	hrtimer_cancel(&port->enable_frs_timer);
+	hrtimer_cancel(&port->vdm_state_machine_timer);
+	hrtimer_cancel(&port->state_machine_timer);
+	kthread_destroy_worker(port->wq);
+}
 
 struct pd_rx_event {
 	struct kthread_work work;
@@ -1719,45 +1789,45 @@ send_cap:
 	return tcpm_pd_transmit(port, TCPC_TX_SOP, &msg);
 }
 
+static void tcpm_mod_delayed_work(struct tcpm_port *port, struct hrtimer *timer,
+				  struct kthread_work *work, unsigned int delay_ms)
+{
+	struct tcpm_port_owner *owner = tcpm_owner(port);
+	unsigned long flags;
+
+	/* The timer callback takes work_lock, so join it outside the lock. */
+	if (!delay_ms)
+		hrtimer_cancel(timer);
+	raw_spin_lock_irqsave(&owner->work_lock, flags);
+	if (!owner->work_stopped) {
+		if (delay_ms)
+			hrtimer_start(timer, ms_to_ktime(delay_ms), HRTIMER_MODE_REL);
+		else
+			kthread_queue_work(port->wq, work);
+	}
+	raw_spin_unlock_irqrestore(&owner->work_lock, flags);
+}
+
 static void mod_tcpm_delayed_work(struct tcpm_port *port, unsigned int delay_ms)
 {
-	if (delay_ms) {
-		hrtimer_start(&port->state_machine_timer, ms_to_ktime(delay_ms), HRTIMER_MODE_REL);
-	} else {
-		hrtimer_cancel(&port->state_machine_timer);
-		kthread_queue_work(port->wq, &port->state_machine);
-	}
+	tcpm_mod_delayed_work(port, &port->state_machine_timer, &port->state_machine, delay_ms);
 }
 
 static void mod_vdm_delayed_work(struct tcpm_port *port, unsigned int delay_ms)
 {
-	if (delay_ms) {
-		hrtimer_start(&port->vdm_state_machine_timer, ms_to_ktime(delay_ms),
-			      HRTIMER_MODE_REL);
-	} else {
-		hrtimer_cancel(&port->vdm_state_machine_timer);
-		kthread_queue_work(port->wq, &port->vdm_state_machine);
-	}
+	tcpm_mod_delayed_work(port, &port->vdm_state_machine_timer, &port->vdm_state_machine,
+			      delay_ms);
 }
 
 static void mod_enable_frs_delayed_work(struct tcpm_port *port, unsigned int delay_ms)
 {
-	if (delay_ms) {
-		hrtimer_start(&port->enable_frs_timer, ms_to_ktime(delay_ms), HRTIMER_MODE_REL);
-	} else {
-		hrtimer_cancel(&port->enable_frs_timer);
-		kthread_queue_work(port->wq, &port->enable_frs);
-	}
+	tcpm_mod_delayed_work(port, &port->enable_frs_timer, &port->enable_frs, delay_ms);
 }
 
 static void mod_send_discover_delayed_work(struct tcpm_port *port, unsigned int delay_ms)
 {
-	if (delay_ms) {
-		hrtimer_start(&port->send_discover_timer, ms_to_ktime(delay_ms), HRTIMER_MODE_REL);
-	} else {
-		hrtimer_cancel(&port->send_discover_timer);
-		kthread_queue_work(port->wq, &port->send_discover_work);
-	}
+	tcpm_mod_delayed_work(port, &port->send_discover_timer, &port->send_discover_work,
+			      delay_ms);
 }
 
 static void tcpm_set_state(struct tcpm_port *port, enum tcpm_state state,
@@ -2033,7 +2103,7 @@ static int tcpm_queue_vdm_unlocked(struct tcpm_port *port, const u32 header,
 	event->cnt = cnt;
 	event->tx_sop_type = tx_sop_type;
 
-	ret = kthread_queue_work(port->wq, &event->work);
+	ret = tcpm_queue_work(port, &event->work);
 	if (!ret) {
 		ret = -EBUSY;
 		goto err_queue;
@@ -3292,6 +3362,12 @@ static int tcpm_altmode_enter(struct typec_altmode *altmode, u32 *vdo)
 	struct tcpm_port *port = typec_altmode_get_drvdata(altmode);
 	int svdm_version;
 	u32 header;
+	int ret;
+
+	guard(srcu)(&tcpm_owner(port)->callbacks);
+	ret = tcpm_callback_status(port);
+	if (ret)
+		return ret;
 
 	svdm_version = typec_get_negotiated_svdm_version(port->typec_port);
 	if (svdm_version < 0)
@@ -3308,6 +3384,12 @@ static int tcpm_altmode_exit(struct typec_altmode *altmode)
 	struct tcpm_port *port = typec_altmode_get_drvdata(altmode);
 	int svdm_version;
 	u32 header;
+	int ret;
+
+	guard(srcu)(&tcpm_owner(port)->callbacks);
+	ret = tcpm_callback_status(port);
+	if (ret)
+		return ret;
 
 	svdm_version = typec_get_negotiated_svdm_version(port->typec_port);
 	if (svdm_version < 0)
@@ -3323,6 +3405,12 @@ static int tcpm_altmode_vdm(struct typec_altmode *altmode,
 			    u32 header, const u32 *data, int count)
 {
 	struct tcpm_port *port = typec_altmode_get_drvdata(altmode);
+	int ret;
+
+	guard(srcu)(&tcpm_owner(port)->callbacks);
+	ret = tcpm_callback_status(port);
+	if (ret)
+		return ret;
 
 	return tcpm_queue_vdm_unlocked(port, header, data, count - 1, TCPC_TX_SOP);
 }
@@ -3340,6 +3428,12 @@ static int tcpm_cable_altmode_enter(struct typec_altmode *altmode, enum typec_pl
 	struct tcpm_port *port = typec_altmode_get_drvdata(altmode);
 	int svdm_version;
 	u32 header;
+	int ret;
+
+	guard(srcu)(&tcpm_owner(port)->callbacks);
+	ret = tcpm_callback_status(port);
+	if (ret)
+		return ret;
 
 	svdm_version = typec_get_cable_svdm_version(port->typec_port);
 	if (svdm_version < 0)
@@ -3356,6 +3450,12 @@ static int tcpm_cable_altmode_exit(struct typec_altmode *altmode, enum typec_plu
 	struct tcpm_port *port = typec_altmode_get_drvdata(altmode);
 	int svdm_version;
 	u32 header;
+	int ret;
+
+	guard(srcu)(&tcpm_owner(port)->callbacks);
+	ret = tcpm_callback_status(port);
+	if (ret)
+		return ret;
 
 	svdm_version = typec_get_cable_svdm_version(port->typec_port);
 	if (svdm_version < 0)
@@ -3371,6 +3471,12 @@ static int tcpm_cable_altmode_vdm(struct typec_altmode *altmode, enum typec_plug
 				  u32 header, const u32 *data, int count)
 {
 	struct tcpm_port *port = typec_altmode_get_drvdata(altmode);
+	int ret;
+
+	guard(srcu)(&tcpm_owner(port)->callbacks);
+	ret = tcpm_callback_status(port);
+	if (ret)
+		return ret;
 
 	return tcpm_queue_vdm_unlocked(port, header, data, count - 1, TCPC_TX_SOP_PRIME);
 }
@@ -4252,7 +4358,8 @@ void tcpm_pd_receive(struct tcpm_port *port, const struct pd_message *msg,
 	event->port = port;
 	event->rx_sop_type = rx_sop_type;
 	memcpy(&event->msg, msg, sizeof(*msg));
-	kthread_queue_work(port->wq, &event->work);
+	if (!tcpm_queue_work(port, &event->work))
+		kfree(event);
 }
 EXPORT_SYMBOL_GPL(tcpm_pd_receive);
 
@@ -7194,7 +7301,7 @@ void tcpm_cc_change(struct tcpm_port *port)
 	spin_lock(&port->pd_event_lock);
 	port->pd_events |= TCPM_CC_EVENT;
 	spin_unlock(&port->pd_event_lock);
-	kthread_queue_work(port->wq, &port->event_work);
+	tcpm_queue_work(port, &port->event_work);
 }
 EXPORT_SYMBOL_GPL(tcpm_cc_change);
 
@@ -7203,7 +7310,7 @@ void tcpm_vbus_change(struct tcpm_port *port)
 	spin_lock(&port->pd_event_lock);
 	port->pd_events |= TCPM_VBUS_EVENT;
 	spin_unlock(&port->pd_event_lock);
-	kthread_queue_work(port->wq, &port->event_work);
+	tcpm_queue_work(port, &port->event_work);
 }
 EXPORT_SYMBOL_GPL(tcpm_vbus_change);
 
@@ -7212,7 +7319,7 @@ void tcpm_pd_hard_reset(struct tcpm_port *port)
 	spin_lock(&port->pd_event_lock);
 	port->pd_events = TCPM_RESET_EVENT;
 	spin_unlock(&port->pd_event_lock);
-	kthread_queue_work(port->wq, &port->event_work);
+	tcpm_queue_work(port, &port->event_work);
 }
 EXPORT_SYMBOL_GPL(tcpm_pd_hard_reset);
 
@@ -7221,7 +7328,7 @@ void tcpm_sink_frs(struct tcpm_port *port)
 	spin_lock(&port->pd_event_lock);
 	port->pd_events |= TCPM_FRS_EVENT;
 	spin_unlock(&port->pd_event_lock);
-	kthread_queue_work(port->wq, &port->event_work);
+	tcpm_queue_work(port, &port->event_work);
 }
 EXPORT_SYMBOL_GPL(tcpm_sink_frs);
 
@@ -7230,7 +7337,7 @@ void tcpm_sourcing_vbus(struct tcpm_port *port)
 	spin_lock(&port->pd_event_lock);
 	port->pd_events |= TCPM_SOURCING_VBUS;
 	spin_unlock(&port->pd_event_lock);
-	kthread_queue_work(port->wq, &port->event_work);
+	tcpm_queue_work(port, &port->event_work);
 }
 EXPORT_SYMBOL_GPL(tcpm_sourcing_vbus);
 
@@ -7239,7 +7346,7 @@ void tcpm_port_clean(struct tcpm_port *port)
 	spin_lock(&port->pd_event_lock);
 	port->pd_events |= TCPM_PORT_CLEAN;
 	spin_unlock(&port->pd_event_lock);
-	kthread_queue_work(port->wq, &port->event_work);
+	tcpm_queue_work(port, &port->event_work);
 }
 EXPORT_SYMBOL_GPL(tcpm_port_clean);
 
@@ -7254,7 +7361,7 @@ void tcpm_port_error_recovery(struct tcpm_port *port)
 	spin_lock(&port->pd_event_lock);
 	port->pd_events |= TCPM_PORT_ERROR;
 	spin_unlock(&port->pd_event_lock);
-	kthread_queue_work(port->wq, &port->event_work);
+	tcpm_queue_work(port, &port->event_work);
 }
 EXPORT_SYMBOL_GPL(tcpm_port_error_recovery);
 
@@ -7323,6 +7430,11 @@ static int tcpm_dr_set(struct typec_port *p, enum typec_data_role data)
 {
 	struct tcpm_port *port = typec_get_drvdata(p);
 	int ret;
+
+	guard(srcu)(&tcpm_owner(port)->callbacks);
+	ret = tcpm_callback_status(port);
+	if (ret)
+		return ret;
 
 	mutex_lock(&port->swap_lock);
 	mutex_lock(&port->lock);
@@ -7396,6 +7508,11 @@ static int tcpm_pr_set(struct typec_port *p, enum typec_role role)
 	struct tcpm_port *port = typec_get_drvdata(p);
 	int ret;
 
+	guard(srcu)(&tcpm_owner(port)->callbacks);
+	ret = tcpm_callback_status(port);
+	if (ret)
+		return ret;
+
 	mutex_lock(&port->swap_lock);
 	mutex_lock(&port->lock);
 
@@ -7445,6 +7562,11 @@ static int tcpm_vconn_set(struct typec_port *p, enum typec_role role)
 	struct tcpm_port *port = typec_get_drvdata(p);
 	int ret;
 
+	guard(srcu)(&tcpm_owner(port)->callbacks);
+	ret = tcpm_callback_status(port);
+	if (ret)
+		return ret;
+
 	mutex_lock(&port->swap_lock);
 	mutex_lock(&port->lock);
 
@@ -7490,6 +7612,11 @@ static int tcpm_try_role(struct typec_port *p, int role)
 	struct tcpm_port *port = typec_get_drvdata(p);
 	struct tcpc_dev	*tcpc = port->tcpc;
 	int ret = 0;
+
+	guard(srcu)(&tcpm_owner(port)->callbacks);
+	ret = tcpm_callback_status(port);
+	if (ret)
+		return ret;
 
 	mutex_lock(&port->lock);
 	if (tcpc->try_role)
@@ -7804,6 +7931,12 @@ static void tcpm_init(struct tcpm_port *port)
 static int tcpm_port_type_set(struct typec_port *p, enum typec_port_type type)
 {
 	struct tcpm_port *port = typec_get_drvdata(p);
+	int ret;
+
+	guard(srcu)(&tcpm_owner(port)->callbacks);
+	ret = tcpm_callback_status(port);
+	if (ret)
+		return ret;
 
 	mutex_lock(&port->lock);
 	if (type == port->port_type)
@@ -7844,6 +7977,10 @@ static struct usb_power_delivery **tcpm_pd_get(struct typec_port *p)
 {
 	struct tcpm_port *port = typec_get_drvdata(p);
 
+	guard(srcu)(&tcpm_owner(port)->callbacks);
+	if (tcpm_callback_status(port))
+		return NULL;
+
 	return port->pds;
 }
 
@@ -7852,6 +7989,11 @@ static int tcpm_pd_set(struct typec_port *p, struct usb_power_delivery *pd)
 	struct tcpm_port *port = typec_get_drvdata(p);
 	struct pd_data *data;
 	int i, ret = 0;
+
+	guard(srcu)(&tcpm_owner(port)->callbacks);
+	ret = tcpm_callback_status(port);
+	if (ret)
+		return ret;
 
 	mutex_lock(&port->lock);
 
@@ -7952,6 +8094,10 @@ static const struct typec_operations tcpm_ops = {
 
 void tcpm_tcpc_reset(struct tcpm_port *port)
 {
+	guard(srcu)(&tcpm_owner(port)->callbacks);
+	if (tcpm_callback_status(port))
+		return;
+
 	mutex_lock(&port->lock);
 	/* XXX: Maintain PD connection if possible? */
 	tcpm_init(port);
@@ -8442,6 +8588,13 @@ static int tcpm_copy_pdos(u32 *dest_pdo, const u32 *src_pdo, unsigned int nr_pdo
 int tcpm_update_sink_capabilities(struct tcpm_port *port, const u32 *pdo, unsigned int nr_pdo,
 				  unsigned int operating_snk_mw)
 {
+	int ret;
+
+	guard(srcu)(&tcpm_owner(port)->callbacks);
+	ret = tcpm_callback_status(port);
+	if (ret)
+		return ret;
+
 	// reuse tcpm_update_sink_capabilities to avoid changing ABI
 	if (nr_pdo == DO_NOT_IGNORE_ALT_MODES || nr_pdo == IGNORE_ALT_MODES) {
 		port->ignore_alt_modes = nr_pdo == IGNORE_ALT_MODES;
@@ -8593,6 +8746,11 @@ static int tcpm_psy_get_prop(struct power_supply *psy,
 	struct tcpm_port *port = power_supply_get_drvdata(psy);
 	int ret = 0;
 
+	guard(srcu)(&tcpm_owner(port)->callbacks);
+	ret = tcpm_callback_status(port);
+	if (ret)
+		return ret;
+
 	switch (psp) {
 	case POWER_SUPPLY_PROP_USB_TYPE:
 		val->intval = port->usb_type;
@@ -8677,6 +8835,11 @@ static int tcpm_psy_set_prop(struct power_supply *psy,
 	struct tcpm_port *port = power_supply_get_drvdata(psy);
 	int ret;
 
+	guard(srcu)(&tcpm_owner(port)->callbacks);
+	ret = tcpm_callback_status(port);
+	if (ret)
+		return ret;
+
 	/*
 	 * All the properties below are related to USB PD. The check needs to be
 	 * property specific when a non-pd related property is added.
@@ -8758,8 +8921,8 @@ static enum hrtimer_restart state_machine_timer_handler(struct hrtimer *timer)
 {
 	struct tcpm_port *port = container_of(timer, struct tcpm_port, state_machine_timer);
 
-	if (port->registered)
-		kthread_queue_work(port->wq, &port->state_machine);
+	if (READ_ONCE(port->registered))
+		tcpm_queue_work(port, &port->state_machine);
 	return HRTIMER_NORESTART;
 }
 
@@ -8767,8 +8930,8 @@ static enum hrtimer_restart vdm_state_machine_timer_handler(struct hrtimer *time
 {
 	struct tcpm_port *port = container_of(timer, struct tcpm_port, vdm_state_machine_timer);
 
-	if (port->registered)
-		kthread_queue_work(port->wq, &port->vdm_state_machine);
+	if (READ_ONCE(port->registered))
+		tcpm_queue_work(port, &port->vdm_state_machine);
 	return HRTIMER_NORESTART;
 }
 
@@ -8776,8 +8939,8 @@ static enum hrtimer_restart enable_frs_timer_handler(struct hrtimer *timer)
 {
 	struct tcpm_port *port = container_of(timer, struct tcpm_port, enable_frs_timer);
 
-	if (port->registered)
-		kthread_queue_work(port->wq, &port->enable_frs);
+	if (READ_ONCE(port->registered))
+		tcpm_queue_work(port, &port->enable_frs);
 	return HRTIMER_NORESTART;
 }
 
@@ -8785,13 +8948,14 @@ static enum hrtimer_restart send_discover_timer_handler(struct hrtimer *timer)
 {
 	struct tcpm_port *port = container_of(timer, struct tcpm_port, send_discover_timer);
 
-	if (port->registered)
-		kthread_queue_work(port->wq, &port->send_discover_work);
+	if (READ_ONCE(port->registered))
+		tcpm_queue_work(port, &port->send_discover_work);
 	return HRTIMER_NORESTART;
 }
 
 struct tcpm_port *tcpm_register_port(struct device *dev, struct tcpc_dev *tcpc)
 {
+	struct tcpm_port_owner *owner;
 	struct tcpm_port *port;
 	int err;
 
@@ -8801,9 +8965,22 @@ struct tcpm_port *tcpm_register_port(struct device *dev, struct tcpc_dev *tcpc)
 	    !tcpc->set_pd_rx || !tcpc->set_roles || !tcpc->pd_transmit)
 		return ERR_PTR(-EINVAL);
 
-	port = devm_kzalloc(dev, sizeof(*port), GFP_KERNEL);
-	if (!port)
+	owner = devm_kzalloc(dev, sizeof(*owner), GFP_KERNEL);
+	if (!owner)
 		return ERR_PTR(-ENOMEM);
+
+	lockdep_register_key(&owner->callback_key);
+	err = init_srcu_struct(&owner->callbacks);
+	if (err) {
+		lockdep_unregister_key(&owner->callback_key);
+		return ERR_PTR(err);
+	}
+	lockdep_set_class(&owner->callbacks, &owner->callback_key);
+	err = devm_add_action_or_reset(dev, tcpm_callbacks_cleanup, owner);
+	if (err)
+		return ERR_PTR(err);
+	raw_spin_lock_init(&owner->work_lock);
+	port = &owner->port;
 
 	port->dev = dev;
 	port->tcpc = tcpc;
@@ -8875,7 +9052,6 @@ struct tcpm_port *tcpm_register_port(struct device *dev, struct tcpc_dev *tcpc)
 	err = devm_tcpm_psy_register(port);
 	if (err)
 		goto out_role_sw_put;
-	power_supply_changed(port->psy);
 
 	err = tcpm_port_register_pd(port);
 	if (err)
@@ -8895,11 +9071,14 @@ struct tcpm_port *tcpm_register_port(struct device *dev, struct tcpc_dev *tcpc)
 				     port->port_altmode, ALTMODE_DISCOVERY_MAX);
 	typec_port_register_cable_ops(port->port_altmode, ARRAY_SIZE(port->port_altmode),
 				      &tcpm_cable_ops);
-	port->registered = true;
+	WRITE_ONCE(port->registered, true);
 
 	mutex_lock(&port->lock);
 	tcpm_init(port);
 	mutex_unlock(&port->lock);
+
+	smp_store_release(&owner->callbacks_ready, true);
+	power_supply_changed(port->psy);
 
 	tcpm_log(port, "%s: registered", dev_name(dev));
 	return port;
@@ -8909,8 +9088,8 @@ out_unregister_pd:
 out_role_sw_put:
 	usb_role_switch_put(port->role_sw);
 out_destroy_wq:
+	tcpm_stop_worker(port);
 	tcpm_debugfs_exit(port);
-	kthread_destroy_worker(port->wq);
 	return ERR_PTR(err);
 }
 EXPORT_SYMBOL_GPL(tcpm_register_port);
@@ -8919,22 +9098,16 @@ void tcpm_unregister_port(struct tcpm_port *port)
 {
 	int i;
 
-	port->registered = false;
-	kthread_destroy_worker(port->wq);
-
-	hrtimer_cancel(&port->send_discover_timer);
-	hrtimer_cancel(&port->enable_frs_timer);
-	hrtimer_cancel(&port->vdm_state_machine_timer);
-	hrtimer_cancel(&port->state_machine_timer);
+	tcpm_stop_worker(port);
 
 	power_supply_put_system_batteries(port->fixed_batt, port->fixed_batt_cnt);
 	tcpm_reset_port(port);
 
-	tcpm_port_unregister_pd(port);
-
 	for (i = 0; i < ARRAY_SIZE(port->port_altmode); i++)
 		typec_unregister_altmode(port->port_altmode[i]);
+	/* pd_get lends the PD array until the sysfs reader has returned. */
 	typec_unregister_port(port->typec_port);
+	tcpm_port_unregister_pd(port);
 	usb_role_switch_put(port->role_sw);
 	tcpm_debugfs_exit(port);
 }
