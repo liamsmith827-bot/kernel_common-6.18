@@ -208,10 +208,12 @@ static LIST_HEAD(bridge_list);
 static void __drm_bridge_free(struct kref *kref)
 {
 	struct drm_bridge *bridge = container_of(kref, struct drm_bridge, refcount);
+	struct module *owner = bridge->owner;
 
 	if (bridge->funcs->destroy)
 		bridge->funcs->destroy(bridge);
 	kfree(bridge->container);
+	module_put(owner);
 }
 
 /**
@@ -1416,6 +1418,33 @@ struct drm_bridge *of_drm_find_bridge(struct device_node *np)
 	return NULL;
 }
 EXPORT_SYMBOL(of_drm_find_bridge);
+
+/**
+ * of_drm_find_bridge_get - find and retain a published bridge
+ * @np: device node
+ *
+ * Unlike of_drm_find_bridge(), this lookup takes a reference while holding
+ * the publication lock, so a concurrent provider removal cannot free the
+ * returned bridge. The caller must release it with drm_bridge_put().
+ *
+ * Return: a referenced bridge, or NULL if none is published for @np.
+ */
+struct drm_bridge *of_drm_find_bridge_get(struct device_node *np)
+{
+	struct drm_bridge *bridge;
+	struct drm_bridge *found = NULL;
+
+	mutex_lock(&bridge_lock);
+	list_for_each_entry(bridge, &bridge_list, list) {
+		if (bridge->of_node == np) {
+			found = drm_bridge_get(bridge);
+			break;
+		}
+	}
+	mutex_unlock(&bridge_lock);
+	return found;
+}
+EXPORT_SYMBOL_GPL(of_drm_find_bridge_get);
 #endif
 
 /**

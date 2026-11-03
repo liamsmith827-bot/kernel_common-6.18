@@ -35,6 +35,7 @@
 
 struct cec_msg;
 struct device_node;
+struct module;
 
 struct drm_bridge;
 struct drm_bridge_timings;
@@ -1153,6 +1154,15 @@ struct drm_bridge {
 	 * @hpd_cb.
 	 */
 	void *hpd_data;
+
+	/**
+	 * @owner: Optional owned module reference for callback lifetime.
+	 *
+	 * A provider may transfer one module reference here before publishing
+	 * the bridge. The core releases it after the final destroy callback.
+	 * The provider must not change this field after publication.
+	 */
+	struct module *owner;
 };
 
 static inline struct drm_bridge *
@@ -1197,8 +1207,13 @@ int drm_bridge_attach(struct drm_encoder *encoder, struct drm_bridge *bridge,
 
 #ifdef CONFIG_OF
 struct drm_bridge *of_drm_find_bridge(struct device_node *np);
+struct drm_bridge *of_drm_find_bridge_get(struct device_node *np);
 #else
 static inline struct drm_bridge *of_drm_find_bridge(struct device_node *np)
+{
+	return NULL;
+}
+static inline struct drm_bridge *of_drm_find_bridge_get(struct device_node *np)
 {
 	return NULL;
 }

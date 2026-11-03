@@ -833,6 +833,7 @@
   drm_bridge_hpd_enable
   drm_bridge_hpd_notify
   drm_bridge_is_panel
+  drm_bridge_put
   drm_bridge_remove
   drm_compat_ioctl
   drm_connector_attach_encoder
@@ -1839,6 +1840,7 @@
   of_dma_is_coherent
   of_dma_router_register
   of_drm_find_bridge
+  of_drm_find_bridge_get
   of_drm_find_panel
   of_find_backlight_by_node
   of_find_compatible_node
