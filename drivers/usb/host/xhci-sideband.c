@@ -166,6 +166,8 @@ xhci_sideband_add_endpoint(struct xhci_sideband *sb,
 	struct xhci_virt_ep *ep;
 	unsigned int ep_index;
 
+	/* Serialize lease publication against USB configuration transactions. */
+	guard(mutex)(xhci_to_hcd(sb->xhci)->bandwidth_mutex);
 	guard(mutex)(&sb->mutex);
 
 	if (!sb->vdev)
@@ -173,6 +175,9 @@ xhci_sideband_add_endpoint(struct xhci_sideband *sb,
 
 	ep_index = xhci_get_endpoint_index(&host_ep->desc);
 	ep = &sb->vdev->eps[ep_index];
+
+	if (!ep->ring)
+		return -ENODEV;
 
 	if (ep->ep_state & EP_HAS_STREAMS)
 		return -EINVAL;
@@ -214,6 +219,7 @@ xhci_sideband_remove_endpoint(struct xhci_sideband *sb,
 	struct xhci_virt_ep *ep;
 	unsigned int ep_index;
 
+	guard(mutex)(xhci_to_hcd(sb->xhci)->bandwidth_mutex);
 	guard(mutex)(&sb->mutex);
 
 	ep_index = xhci_get_endpoint_index(&host_ep->desc);
@@ -485,33 +491,36 @@ xhci_sideband_unregister(struct xhci_sideband *sb)
 
 	xhci = sb->xhci;
 
-	scoped_guard(mutex, &sb->mutex) {
-		vdev = sb->vdev;
-		if (!vdev)
-			return;
+	scoped_guard(mutex, xhci_to_hcd(xhci)->bandwidth_mutex) {
+		scoped_guard(mutex, &sb->mutex) {
+			vdev = sb->vdev;
+			if (!vdev)
+				return;
 
-		for (i = 0; i < EP_CTX_PER_DEV; i++) {
-			if (!sb->eps[i])
-				continue;
-			ret = __xhci_sideband_remove_endpoint(sb, sb->eps[i]);
-			if (ret) {
-				xhci_warn(xhci, "Sideband endpoint %d stop failed at unregister: %d\n",
-					  i, ret);
-				/* Final unregister cannot leave a pointer to the freed sideband. */
-				rcu_assign_pointer(sb->eps[i]->sideband, NULL);
-				sb->eps[i] = NULL;
+			for (i = 0; i < EP_CTX_PER_DEV; i++) {
+				if (!sb->eps[i])
+					continue;
+				ret = __xhci_sideband_remove_endpoint(sb, sb->eps[i]);
+				if (ret) {
+					xhci_warn(xhci,
+						  "Sideband endpoint %d stop failed at unregister: %d\n",
+						  i, ret);
+					/* Do not leave a pointer to the freed sideband. */
+					rcu_assign_pointer(sb->eps[i]->sideband, NULL);
+					sb->eps[i] = NULL;
+				}
 			}
+
+			__xhci_sideband_remove_interrupter(sb);
+
+			sb->vdev = NULL;
 		}
 
-		__xhci_sideband_remove_interrupter(sb);
-
-		sb->vdev = NULL;
+		spin_lock_irq(&xhci->lock);
+		sb->xhci = NULL;
+		vdev->sideband = NULL;
+		spin_unlock_irq(&xhci->lock);
 	}
-
-	spin_lock_irq(&xhci->lock);
-	sb->xhci = NULL;
-	vdev->sideband = NULL;
-	spin_unlock_irq(&xhci->lock);
 
 	/* A client must not unregister from within its own ring-free callback. */
 	synchronize_srcu(&xhci_sideband_callbacks);

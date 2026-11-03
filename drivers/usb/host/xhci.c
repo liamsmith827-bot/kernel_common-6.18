@@ -1944,6 +1944,10 @@ int xhci_drop_endpoint(struct usb_hcd *hcd, struct usb_device *udev,
 	}
 
 	ep_index = xhci_get_endpoint_index(&ep->desc);
+	/* Sideband producers must retire their lease before replacing the ring. */
+	if (rcu_access_pointer(xhci->devs[udev->slot_id]->eps[ep_index].sideband))
+		return -EBUSY;
+
 	ep_ctx = xhci_get_ep_ctx(xhci, out_ctx, ep_index);
 	/* If the HC already knows the endpoint is disabled,
 	 * or the HCD has noted it is disabled, ignore this request
