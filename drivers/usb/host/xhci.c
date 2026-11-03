@@ -2940,6 +2940,10 @@ int xhci_stop_endpoint_sync(struct xhci_hcd *xhci, struct xhci_virt_ep *ep, int 
 	    command->status == COMP_COMMAND_RING_STOPPED) {
 		xhci_warn(xhci, "Timeout while waiting for stop endpoint command\n");
 		ret = -ETIME;
+	} else if (command->status != COMP_SUCCESS) {
+		xhci_warn(xhci, "Stop endpoint command failed with completion code %u\n",
+			  command->status);
+		ret = -EIO;
 	}
 out:
 	xhci_free_command(xhci, command);

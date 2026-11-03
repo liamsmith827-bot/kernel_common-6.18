@@ -76,19 +76,22 @@ err:
 }
 
 /* Caller must hold sb->mutex */
-static void
+static int
 __xhci_sideband_remove_endpoint(struct xhci_sideband *sb, struct xhci_virt_ep *ep)
 {
+	int ret;
+
 	lockdep_assert_held(&sb->mutex);
 
-	/*
-	 * Issue a stop endpoint command when an endpoint is removed.
-	 * The stop ep cmd handler will handle the ring cleanup.
-	 */
-	xhci_stop_endpoint_sync(sb->xhci, ep, 0, GFP_KERNEL);
+	/* Keep the lease retryable if an attempted stop was not acknowledged. */
+	ret = xhci_stop_endpoint_sync(sb->xhci, ep, 0, GFP_KERNEL);
+	/* The helper returns ENODEV when the ring is absent or already not running. */
+	if (ret && ret != -ENODEV)
+		return ret;
 
 	ep->sideband = NULL;
 	sb->eps[ep->ep_index] = NULL;
+	return 0;
 }
 
 /* Caller must hold sb->mutex */
@@ -205,9 +208,7 @@ xhci_sideband_remove_endpoint(struct xhci_sideband *sb,
 	if (!ep || !ep->sideband || ep->sideband != sb)
 		return -ENODEV;
 
-	__xhci_sideband_remove_endpoint(sb, ep);
-
-	return 0;
+	return __xhci_sideband_remove_endpoint(sb, ep);
 }
 EXPORT_SYMBOL_GPL(xhci_sideband_remove_endpoint);
 
@@ -463,7 +464,7 @@ xhci_sideband_unregister(struct xhci_sideband *sb)
 {
 	struct xhci_virt_device *vdev;
 	struct xhci_hcd *xhci;
-	int i;
+	int i, ret;
 
 	if (!sb)
 		return;
@@ -475,9 +476,18 @@ xhci_sideband_unregister(struct xhci_sideband *sb)
 		if (!vdev)
 			return;
 
-		for (i = 0; i < EP_CTX_PER_DEV; i++)
-			if (sb->eps[i])
-				__xhci_sideband_remove_endpoint(sb, sb->eps[i]);
+		for (i = 0; i < EP_CTX_PER_DEV; i++) {
+			if (!sb->eps[i])
+				continue;
+			ret = __xhci_sideband_remove_endpoint(sb, sb->eps[i]);
+			if (ret) {
+				xhci_warn(xhci, "Sideband endpoint %d stop failed at unregister: %d\n",
+					  i, ret);
+				/* Final unregister cannot leave a pointer to the freed sideband. */
+				sb->eps[i]->sideband = NULL;
+				sb->eps[i] = NULL;
+			}
+		}
 
 		__xhci_sideband_remove_interrupter(sb);
 
