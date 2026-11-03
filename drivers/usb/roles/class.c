@@ -15,6 +15,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
 
 static const struct class role_class = {
 	.name = "usb_role",
@@ -24,6 +25,7 @@ struct usb_role_switch {
 	struct device dev;
 	struct lock_class_key key;
 	struct mutex lock; /* device lock*/
+	spinlock_t ref_lock; /* registration and module-owner acquisition */
 	struct module *module; /* the module this device depends on */
 	enum usb_role role;
 	bool registered;
@@ -38,6 +40,26 @@ struct usb_role_switch {
 };
 
 #define to_role_switch(d)	container_of(d, struct usb_role_switch, dev)
+
+/* The caller owns a device reference, which need not retain the provider module. */
+static bool usb_role_switch_try_get(struct usb_role_switch *sw)
+{
+	bool acquired;
+
+	spin_lock(&sw->ref_lock);
+	acquired = sw->registered && try_module_get(sw->module);
+	spin_unlock(&sw->ref_lock);
+	return acquired;
+}
+
+static void usb_role_switch_retire(struct usb_role_switch *sw)
+{
+	mutex_lock(&sw->lock);
+	spin_lock(&sw->ref_lock);
+	sw->registered = false;
+	spin_unlock(&sw->ref_lock);
+	mutex_unlock(&sw->lock);
+}
 
 static int connector_bind(struct device *dev, struct device *connector, void *data)
 {
@@ -178,7 +200,7 @@ struct usb_role_switch *usb_role_switch_get(struct device *dev)
 		sw = device_connection_find_match(dev, "usb-role-switch", NULL,
 						  usb_role_switch_match);
 
-	if (!IS_ERR_OR_NULL(sw) && !try_module_get(sw->module)) {
+	if (!IS_ERR_OR_NULL(sw) && !usb_role_switch_try_get(sw)) {
 		put_device(&sw->dev);
 		return ERR_PTR(-EPROBE_DEFER);
 	}
@@ -202,7 +224,7 @@ struct usb_role_switch *fwnode_usb_role_switch_get(struct fwnode_handle *fwnode)
 	if (!sw)
 		sw = fwnode_connection_find_match(fwnode, "usb-role-switch",
 						  NULL, usb_role_switch_match);
-	if (!IS_ERR_OR_NULL(sw) && !try_module_get(sw->module)) {
+	if (!IS_ERR_OR_NULL(sw) && !usb_role_switch_try_get(sw)) {
 		put_device(&sw->dev);
 		return ERR_PTR(-EPROBE_DEFER);
 	}
@@ -245,7 +267,7 @@ usb_role_switch_find_by_fwnode(const struct fwnode_handle *fwnode)
 	dev = class_find_device_by_fwnode(&role_class, fwnode);
 	if (dev) {
 		sw = to_role_switch(dev);
-		if (!try_module_get(sw->module)) {
+		if (!usb_role_switch_try_get(sw)) {
 			put_device(dev);
 			return NULL;
 		}
@@ -387,6 +409,7 @@ usb_role_switch_register(struct device *parent,
 
 	lockdep_register_key(&sw->key);
 	mutex_init_with_key(&sw->lock, &sw->key);
+	spin_lock_init(&sw->ref_lock);
 
 	sw->allow_userspace_control = desc->allow_userspace_control;
 	sw->usb2_port = desc->usb2_port;
@@ -408,9 +431,7 @@ usb_role_switch_register(struct device *parent,
 
 	ret = device_register(&sw->dev);
 	if (ret) {
-		mutex_lock(&sw->lock);
-		sw->registered = false;
-		mutex_unlock(&sw->lock);
+		usb_role_switch_retire(sw);
 		put_device(&sw->dev);
 		return ERR_PTR(ret);
 	}
@@ -439,9 +460,7 @@ void usb_role_switch_unregister(struct usb_role_switch *sw)
 {
 	if (IS_ERR_OR_NULL(sw))
 		return;
-	mutex_lock(&sw->lock);
-	sw->registered = false;
-	mutex_unlock(&sw->lock);
+	usb_role_switch_retire(sw);
 	if (dev_fwnode(&sw->dev))
 		component_del(&sw->dev, &connector_ops);
 	device_unregister(&sw->dev);
