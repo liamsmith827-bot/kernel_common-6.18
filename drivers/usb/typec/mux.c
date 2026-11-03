@@ -13,11 +13,63 @@
 #include <linux/mutex.h>
 #include <linux/property.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
 
 #include "class.h"
 #include "mux.h"
 
 #define TYPEC_MUX_MAX_DEVS	3
+
+struct typec_mux_lifetime {
+	struct lock_class_key key;
+	struct mutex lock;
+	spinlock_t ref_lock;
+	struct module *owner;
+	bool registered;
+};
+
+static struct typec_mux_lifetime *typec_mux_lifetime_alloc(struct device *parent)
+{
+	struct typec_mux_lifetime *lifetime;
+
+	lifetime = kzalloc(sizeof(*lifetime), GFP_KERNEL);
+	if (!lifetime)
+		return NULL;
+
+	lockdep_register_key(&lifetime->key);
+	mutex_init_with_key(&lifetime->lock, &lifetime->key);
+	spin_lock_init(&lifetime->ref_lock);
+	lifetime->owner = parent->driver->owner;
+	lifetime->registered = true;
+	return lifetime;
+}
+
+static void typec_mux_lifetime_free(struct typec_mux_lifetime *lifetime)
+{
+	mutex_destroy(&lifetime->lock);
+	lockdep_unregister_key(&lifetime->key);
+	kfree(lifetime);
+}
+
+/* A device reference keeps this state alive across lookup and provider retirement. */
+static bool typec_mux_lifetime_get(struct typec_mux_lifetime *lifetime)
+{
+	bool acquired;
+
+	spin_lock(&lifetime->ref_lock);
+	acquired = lifetime->registered && try_module_get(lifetime->owner);
+	spin_unlock(&lifetime->ref_lock);
+	return acquired;
+}
+
+static void typec_mux_lifetime_retire(struct typec_mux_lifetime *lifetime)
+{
+	mutex_lock(&lifetime->lock);
+	spin_lock(&lifetime->ref_lock);
+	lifetime->registered = false;
+	spin_unlock(&lifetime->ref_lock);
+	mutex_unlock(&lifetime->lock);
+}
 
 struct typec_switch {
 	struct typec_switch_dev *sw_devs[TYPEC_MUX_MAX_DEVS];
@@ -35,6 +87,7 @@ static int switch_fwnode_match(struct device *dev, const void *fwnode)
 static void *typec_switch_match(const struct fwnode_handle *fwnode,
 				const char *id, void *data)
 {
+	struct typec_switch_dev *sw_dev;
 	struct device *dev;
 
 	/*
@@ -56,7 +109,15 @@ static void *typec_switch_match(const struct fwnode_handle *fwnode,
 	dev = class_find_device(&typec_mux_class, NULL, fwnode,
 				switch_fwnode_match);
 
-	return dev ? to_typec_switch_dev(dev) : ERR_PTR(-EPROBE_DEFER);
+	if (!dev)
+		return ERR_PTR(-EPROBE_DEFER);
+
+	sw_dev = to_typec_switch_dev(dev);
+	if (!typec_mux_lifetime_get(sw_dev->lifetime)) {
+		put_device(dev);
+		return ERR_PTR(-EPROBE_DEFER);
+	}
+	return sw_dev;
 }
 
 /**
@@ -96,10 +157,8 @@ struct typec_switch *fwnode_typec_switch_get(struct fwnode_handle *fwnode)
 		}
 	}
 
-	for (i = 0; i < count; i++) {
-		WARN_ON(!try_module_get(sw_devs[i]->dev.parent->driver->owner));
+	for (i = 0; i < count; i++)
 		sw->sw_devs[i] = sw_devs[i];
-	}
 
 	sw->num_sw_devs = count;
 
@@ -107,8 +166,10 @@ struct typec_switch *fwnode_typec_switch_get(struct fwnode_handle *fwnode)
 
 put_sw_devs:
 	for (i = 0; i < count; i++) {
-		if (!IS_ERR(sw_devs[i]))
+		if (!IS_ERR(sw_devs[i])) {
+			module_put(sw_devs[i]->lifetime->owner);
 			put_device(&sw_devs[i]->dev);
+		}
 	}
 
 	kfree(sw);
@@ -134,7 +195,7 @@ void typec_switch_put(struct typec_switch *sw)
 	for (i = 0; i < sw->num_sw_devs; i++) {
 		sw_dev = sw->sw_devs[i];
 
-		module_put(sw_dev->dev.parent->driver->owner);
+		module_put(sw_dev->lifetime->owner);
 		put_device(&sw_dev->dev);
 	}
 	kfree(sw);
@@ -143,7 +204,10 @@ EXPORT_SYMBOL_GPL(typec_switch_put);
 
 static void typec_switch_release(struct device *dev)
 {
-	kfree(to_typec_switch_dev(dev));
+	struct typec_switch_dev *sw_dev = to_typec_switch_dev(dev);
+
+	typec_mux_lifetime_free(sw_dev->lifetime);
+	kfree(sw_dev);
 }
 
 const struct device_type typec_switch_dev_type = {
@@ -175,6 +239,12 @@ typec_switch_register(struct device *parent,
 	if (!sw_dev)
 		return ERR_PTR(-ENOMEM);
 
+	sw_dev->lifetime = typec_mux_lifetime_alloc(parent);
+	if (!sw_dev->lifetime) {
+		kfree(sw_dev);
+		return ERR_PTR(-ENOMEM);
+	}
+
 	sw_dev->set = desc->set;
 
 	device_initialize(&sw_dev->dev);
@@ -192,6 +262,7 @@ typec_switch_register(struct device *parent,
 	ret = device_add(&sw_dev->dev);
 	if (ret) {
 		dev_err(parent, "failed to register switch (%d)\n", ret);
+		typec_mux_lifetime_retire(sw_dev->lifetime);
 		put_device(&sw_dev->dev);
 		return ERR_PTR(ret);
 	}
@@ -213,7 +284,12 @@ int typec_switch_set(struct typec_switch *sw,
 	for (i = 0; i < sw->num_sw_devs; i++) {
 		sw_dev = sw->sw_devs[i];
 
-		ret = sw_dev->set(sw_dev, orientation);
+		mutex_lock(&sw_dev->lifetime->lock);
+		if (sw_dev->lifetime->registered)
+			ret = sw_dev->set(sw_dev, orientation);
+		else
+			ret = -ENODEV;
+		mutex_unlock(&sw_dev->lifetime->lock);
 		if (ret && ret != -EOPNOTSUPP)
 			return ret;
 	}
@@ -227,11 +303,16 @@ EXPORT_SYMBOL_GPL(typec_switch_set);
  * @sw_dev: USB Type-C orientation switch
  *
  * Unregister switch that was registered with typec_switch_register().
+ * Joins admitted callbacks; the provider must drain their queued work before
+ * freeing private state. Do not call from this switch's callback or while
+ * holding a lock needed by it.
  */
 void typec_switch_unregister(struct typec_switch_dev *sw_dev)
 {
-	if (!IS_ERR_OR_NULL(sw_dev))
-		device_unregister(&sw_dev->dev);
+	if (IS_ERR_OR_NULL(sw_dev))
+		return;
+	typec_mux_lifetime_retire(sw_dev->lifetime);
+	device_unregister(&sw_dev->dev);
 }
 EXPORT_SYMBOL_GPL(typec_switch_unregister);
 
@@ -265,6 +346,7 @@ static int mux_fwnode_match(struct device *dev, const void *fwnode)
 static void *typec_mux_match(const struct fwnode_handle *fwnode,
 			     const char *id, void *data)
 {
+	struct typec_mux_dev *mux_dev;
 	struct device *dev;
 
 	/*
@@ -281,7 +363,15 @@ static void *typec_mux_match(const struct fwnode_handle *fwnode,
 	dev = class_find_device(&typec_mux_class, NULL, fwnode,
 				mux_fwnode_match);
 
-	return dev ? to_typec_mux_dev(dev) : ERR_PTR(-EPROBE_DEFER);
+	if (!dev)
+		return ERR_PTR(-EPROBE_DEFER);
+
+	mux_dev = to_typec_mux_dev(dev);
+	if (!typec_mux_lifetime_get(mux_dev->lifetime)) {
+		put_device(dev);
+		return ERR_PTR(-EPROBE_DEFER);
+	}
+	return mux_dev;
 }
 
 /**
@@ -321,10 +411,8 @@ struct typec_mux *fwnode_typec_mux_get(struct fwnode_handle *fwnode)
 		}
 	}
 
-	for (i = 0; i < count; i++) {
-		WARN_ON(!try_module_get(mux_devs[i]->dev.parent->driver->owner));
+	for (i = 0; i < count; i++)
 		mux->mux_devs[i] = mux_devs[i];
-	}
 
 	mux->num_mux_devs = count;
 
@@ -332,8 +420,10 @@ struct typec_mux *fwnode_typec_mux_get(struct fwnode_handle *fwnode)
 
 put_mux_devs:
 	for (i = 0; i < count; i++) {
-		if (!IS_ERR(mux_devs[i]))
+		if (!IS_ERR(mux_devs[i])) {
+			module_put(mux_devs[i]->lifetime->owner);
 			put_device(&mux_devs[i]->dev);
+		}
 	}
 
 	kfree(mux);
@@ -358,7 +448,7 @@ void typec_mux_put(struct typec_mux *mux)
 
 	for (i = 0; i < mux->num_mux_devs; i++) {
 		mux_dev = mux->mux_devs[i];
-		module_put(mux_dev->dev.parent->driver->owner);
+		module_put(mux_dev->lifetime->owner);
 		put_device(&mux_dev->dev);
 	}
 	kfree(mux);
@@ -377,7 +467,12 @@ int typec_mux_set(struct typec_mux *mux, struct typec_mux_state *state)
 	for (i = 0; i < mux->num_mux_devs; i++) {
 		mux_dev = mux->mux_devs[i];
 
-		ret = mux_dev->set(mux_dev, state);
+		mutex_lock(&mux_dev->lifetime->lock);
+		if (mux_dev->lifetime->registered)
+			ret = mux_dev->set(mux_dev, state);
+		else
+			ret = -ENODEV;
+		mutex_unlock(&mux_dev->lifetime->lock);
 		if (ret && ret != -EOPNOTSUPP)
 			return ret;
 	}
@@ -388,7 +483,10 @@ EXPORT_SYMBOL_GPL(typec_mux_set);
 
 static void typec_mux_release(struct device *dev)
 {
-	kfree(to_typec_mux_dev(dev));
+	struct typec_mux_dev *mux_dev = to_typec_mux_dev(dev);
+
+	typec_mux_lifetime_free(mux_dev->lifetime);
+	kfree(mux_dev);
 }
 
 const struct device_type typec_mux_dev_type = {
@@ -419,6 +517,12 @@ typec_mux_register(struct device *parent, const struct typec_mux_desc *desc)
 	if (!mux_dev)
 		return ERR_PTR(-ENOMEM);
 
+	mux_dev->lifetime = typec_mux_lifetime_alloc(parent);
+	if (!mux_dev->lifetime) {
+		kfree(mux_dev);
+		return ERR_PTR(-ENOMEM);
+	}
+
 	mux_dev->set = desc->set;
 
 	device_initialize(&mux_dev->dev);
@@ -436,6 +540,7 @@ typec_mux_register(struct device *parent, const struct typec_mux_desc *desc)
 	ret = device_add(&mux_dev->dev);
 	if (ret) {
 		dev_err(parent, "failed to register mux (%d)\n", ret);
+		typec_mux_lifetime_retire(mux_dev->lifetime);
 		put_device(&mux_dev->dev);
 		return ERR_PTR(ret);
 	}
@@ -449,11 +554,16 @@ EXPORT_SYMBOL_GPL(typec_mux_register);
  * @mux_dev: USB Type-C Connector Multiplexer/DeMultiplexer
  *
  * Unregister mux that was registered with typec_mux_register().
+ * Joins admitted callbacks; the provider must drain their queued work before
+ * freeing private state. Do not call from this mux's callback or while holding
+ * a lock needed by it.
  */
 void typec_mux_unregister(struct typec_mux_dev *mux_dev)
 {
-	if (!IS_ERR_OR_NULL(mux_dev))
-		device_unregister(&mux_dev->dev);
+	if (IS_ERR_OR_NULL(mux_dev))
+		return;
+	typec_mux_lifetime_retire(mux_dev->lifetime);
+	device_unregister(&mux_dev->dev);
 }
 EXPORT_SYMBOL_GPL(typec_mux_unregister);
 

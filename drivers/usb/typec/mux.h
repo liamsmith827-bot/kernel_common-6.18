@@ -6,16 +6,18 @@
 #include <linux/usb/typec_mux.h>
 #include <linux/android_kabi.h>
 
+struct typec_mux_lifetime;
+
 struct typec_switch_dev {
 	struct device dev;
 	typec_switch_set_fn_t set;
-	ANDROID_KABI_RESERVE(1);
+	ANDROID_KABI_USE(1, struct typec_mux_lifetime *lifetime);
 };
 
 struct typec_mux_dev {
 	struct device dev;
 	typec_mux_set_fn_t set;
-	ANDROID_KABI_RESERVE(1);
+	ANDROID_KABI_USE(1, struct typec_mux_lifetime *lifetime);
 };
 
 #define to_typec_switch_dev(_dev_) container_of(_dev_, struct typec_switch_dev, dev)
