@@ -85,6 +85,7 @@ impl<T: drm::Driver> Device<T> {
         patchlevel: T::INFO.patchlevel,
         name: crate::str::as_char_ptr_in_const_context(T::INFO.name).cast_mut(),
         desc: crate::str::as_char_ptr_in_const_context(T::INFO.desc).cast_mut(),
+        date: core::ptr::null(),
 
         driver_features: drm::driver::FEAT_GEM,
         ioctls: T::IOCTLS.as_ptr(),
