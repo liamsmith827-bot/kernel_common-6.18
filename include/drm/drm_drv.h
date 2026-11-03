@@ -431,6 +431,12 @@ struct drm_driver {
 	 * some examples.
 	 */
 	const struct file_operations *fops;
+
+	/**
+	 * @date: Optional legacy VERSION date for existing Pixel userspace.
+	 * New drivers should leave this unset and use the core default.
+	 */
+	const char *date;
 };
 
 void *__devm_drm_dev_alloc(struct device *parent,

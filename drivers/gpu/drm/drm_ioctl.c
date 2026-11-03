@@ -551,7 +551,8 @@ int drm_version(struct drm_device *dev, void *data,
 
 	/* Driver date is deprecated. Userspace expects a non-empty string. */
 	if (!err)
-		err = drm_copy_field(version->date, &version->date_len, "0");
+		err = drm_copy_field(version->date, &version->date_len,
+				     dev->driver->date ?: "0");
 	if (!err)
 		err = drm_copy_field(version->desc, &version->desc_len,
 				dev->driver->desc);
