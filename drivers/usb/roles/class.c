@@ -178,8 +178,10 @@ struct usb_role_switch *usb_role_switch_get(struct device *dev)
 		sw = device_connection_find_match(dev, "usb-role-switch", NULL,
 						  usb_role_switch_match);
 
-	if (!IS_ERR_OR_NULL(sw))
-		WARN_ON(!try_module_get(sw->module));
+	if (!IS_ERR_OR_NULL(sw) && !try_module_get(sw->module)) {
+		put_device(&sw->dev);
+		return ERR_PTR(-EPROBE_DEFER);
+	}
 
 	return sw;
 }
@@ -200,8 +202,10 @@ struct usb_role_switch *fwnode_usb_role_switch_get(struct fwnode_handle *fwnode)
 	if (!sw)
 		sw = fwnode_connection_find_match(fwnode, "usb-role-switch",
 						  NULL, usb_role_switch_match);
-	if (!IS_ERR_OR_NULL(sw))
-		WARN_ON(!try_module_get(sw->module));
+	if (!IS_ERR_OR_NULL(sw) && !try_module_get(sw->module)) {
+		put_device(&sw->dev);
+		return ERR_PTR(-EPROBE_DEFER);
+	}
 
 	return sw;
 }
@@ -241,7 +245,10 @@ usb_role_switch_find_by_fwnode(const struct fwnode_handle *fwnode)
 	dev = class_find_device_by_fwnode(&role_class, fwnode);
 	if (dev) {
 		sw = to_role_switch(dev);
-		WARN_ON(!try_module_get(sw->module));
+		if (!try_module_get(sw->module)) {
+			put_device(dev);
+			return NULL;
+		}
 	}
 
 	return sw;
