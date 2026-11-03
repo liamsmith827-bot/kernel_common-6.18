@@ -7,6 +7,7 @@
  */
 
 #include <linux/cdev.h>
+#include <linux/completion.h>
 #include <linux/device.h>
 #include <linux/dma-buf.h>
 #include <linux/dma-heap.h>
@@ -15,6 +16,7 @@
 #include <linux/list.h>
 #include <linux/nospec.h>
 #include <linux/page_size_compat.h>
+#include <linux/rwsem.h>
 #include <linux/syscalls.h>
 #include <linux/uaccess.h>
 #include <linux/xarray.h>
@@ -45,7 +47,10 @@ struct dma_heap {
 	struct list_head list;
 	struct cdev heap_cdev;
 	struct kref refcount;
-	struct device *heap_dev;
+	struct device heap_dev;
+	struct completion registration_done;
+	struct rw_semaphore ops_lock;
+	bool registered;
 };
 
 static LIST_HEAD(heap_list);
@@ -98,6 +103,11 @@ struct dma_buf *dma_heap_buffer_alloc(struct dma_heap *heap, size_t len,
 	if (!len)
 		return ERR_PTR(-EINVAL);
 
+	wait_for_completion(&heap->registration_done);
+	guard(rwsem_read)(&heap->ops_lock);
+	if (!heap->registered)
+		return ERR_PTR(-ENODEV);
+
 	trace_android_vh_dma_heap_buffer_alloc_start(heap->name, len,
 			fd_flags, heap_flags);
 	trace_android_vh_dma_heap_buffer_alloc_lat_start(&stime);
@@ -133,13 +143,7 @@ EXPORT_SYMBOL_GPL(dma_heap_bufferfd_alloc);
 
 static int dma_heap_open(struct inode *inode, struct file *file)
 {
-	struct dma_heap *heap;
-
-	heap = xa_load(&dma_heap_minors, iminor(inode));
-	if (!heap) {
-		pr_err("dma_heap: minor %d unknown.\n", iminor(inode));
-		return -ENODEV;
-	}
+	struct dma_heap *heap = container_of(inode->i_cdev, struct dma_heap, heap_cdev);
 
 	/* instance data as context */
 	file->private_data = heap;
@@ -254,30 +258,41 @@ void *dma_heap_get_drvdata(struct dma_heap *heap)
 }
 EXPORT_SYMBOL_NS_GPL(dma_heap_get_drvdata, "DMA_BUF_HEAP");
 
-static void dma_heap_release(struct kref *ref)
+static void dma_heap_device_release(struct device *dev)
 {
-	struct dma_heap *heap = container_of(ref, struct dma_heap, refcount);
-	int minor = MINOR(heap->heap_devt);
-
-	/* Note, we already holding the heap_list_lock here */
-	list_del(&heap->list);
-
-	device_destroy(dma_heap_class, heap->heap_devt);
-	cdev_del(&heap->heap_cdev);
-	xa_erase(&dma_heap_minors, minor);
+	struct dma_heap *heap = container_of(dev, struct dma_heap, heap_dev);
 
 	kfree(heap);
 }
 
+static void dma_heap_unlist(struct kref *ref)
+{
+	struct dma_heap *heap = container_of(ref, struct dma_heap, refcount);
+
+	/* Protected against dma_heap_find by heap_list_lock. */
+	list_del(&heap->list);
+}
+
 void dma_heap_put(struct dma_heap *h)
 {
+	bool last;
+
 	/*
 	 * Take the heap_list_lock now to avoid racing with code
 	 * scanning the list and then taking a kref.
 	 */
 	mutex_lock(&heap_list_lock);
-	kref_put(&h->refcount, dma_heap_release);
+	last = kref_put(&h->refcount, dma_heap_unlist);
 	mutex_unlock(&heap_list_lock);
+	if (!last)
+		return;
+
+	/* Allocators may look up other heaps; do not join them under the list lock. */
+	scoped_guard(rwsem_write, &h->ops_lock)
+		h->registered = false;
+	cdev_device_del(&h->heap_cdev, &h->heap_dev);
+	xa_erase(&dma_heap_minors, MINOR(h->heap_devt));
+	put_device(&h->heap_dev);
 }
 EXPORT_SYMBOL_GPL(dma_heap_put);
 
@@ -290,7 +305,7 @@ EXPORT_SYMBOL_GPL(dma_heap_put);
  */
 struct device *dma_heap_get_dev(struct dma_heap *heap)
 {
-	return heap->heap_dev;
+	return &heap->heap_dev;
 }
 EXPORT_SYMBOL_GPL(dma_heap_get_dev);
 
@@ -313,7 +328,7 @@ EXPORT_SYMBOL_NS_GPL(dma_heap_get_name, "DMA_BUF_HEAP");
  */
 struct dma_heap *dma_heap_add(const struct dma_heap_export_info *exp_info)
 {
-	struct dma_heap *heap, *h, *err_ret;
+	struct dma_heap *heap, *h;
 	unsigned int minor;
 	int ret;
 
@@ -332,6 +347,11 @@ struct dma_heap *dma_heap_add(const struct dma_heap_export_info *exp_info)
 		return ERR_PTR(-ENOMEM);
 
 	kref_init(&heap->refcount);
+	device_initialize(&heap->heap_dev);
+	heap->heap_dev.class = dma_heap_class;
+	heap->heap_dev.release = dma_heap_device_release;
+	init_completion(&heap->registration_done);
+	init_rwsem(&heap->ops_lock);
 	heap->name = exp_info->name;
 	heap->ops = exp_info->ops;
 	heap->priv = exp_info->priv;
@@ -341,34 +361,22 @@ struct dma_heap *dma_heap_add(const struct dma_heap_export_info *exp_info)
 		       XA_LIMIT(0, NUM_HEAP_MINORS - 1), GFP_KERNEL);
 	if (ret < 0) {
 		pr_err("dma_heap: Unable to get minor number for heap\n");
-		err_ret = ERR_PTR(ret);
-		goto err0;
+		goto err_put;
 	}
 
 	/* Create device */
 	heap->heap_devt = MKDEV(MAJOR(dma_heap_devt), minor);
+	heap->heap_dev.devt = heap->heap_devt;
+	ret = dev_set_name(&heap->heap_dev, "%s", heap->name);
+	if (ret)
+		goto err_minor;
 
 	cdev_init(&heap->heap_cdev, &dma_heap_fops);
-	ret = cdev_add(&heap->heap_cdev, heap->heap_devt, 1);
+	ret = cdev_device_add(&heap->heap_cdev, &heap->heap_dev);
 	if (ret < 0) {
-		pr_err("dma_heap: Unable to add char device\n");
-		err_ret = ERR_PTR(ret);
-		goto err1;
+		pr_err("dma_heap: Unable to add heap device\n");
+		goto err_minor;
 	}
-
-	heap->heap_dev = device_create(dma_heap_class,
-				       NULL,
-				       heap->heap_devt,
-				       NULL,
-				       heap->name);
-	if (IS_ERR(heap->heap_dev)) {
-		pr_err("dma_heap: Unable to create device\n");
-		err_ret = ERR_CAST(heap->heap_dev);
-		goto err2;
-	}
-
-	/* Make sure it doesn't disappear on us */
-	heap->heap_dev = get_device(heap->heap_dev);
 
 	mutex_lock(&heap_list_lock);
 	/* check the name is unique */
@@ -377,27 +385,28 @@ struct dma_heap *dma_heap_add(const struct dma_heap_export_info *exp_info)
 			mutex_unlock(&heap_list_lock);
 			pr_err("dma_heap: Already registered heap named %s\n",
 			       exp_info->name);
-			err_ret = ERR_PTR(-EINVAL);
-			put_device(heap->heap_dev);
-			goto err3;
+			ret = -EINVAL;
+			goto err_device;
 		}
 	}
 
 	/* Add heap to the list */
+	heap->registered = true;
 	list_add(&heap->list, &heap_list);
 	mutex_unlock(&heap_list_lock);
+	complete_all(&heap->registration_done);
 
 	return heap;
 
-err3:
-	device_destroy(dma_heap_class, heap->heap_devt);
-err2:
-	cdev_del(&heap->heap_cdev);
-err1:
+err_device:
+	cdev_device_del(&heap->heap_cdev, &heap->heap_dev);
+err_minor:
 	xa_erase(&dma_heap_minors, minor);
-err0:
-	kfree(heap);
-	return err_ret;
+err_put:
+	/* An early open may survive a failed cdev/device publication. */
+	complete_all(&heap->registration_done);
+	put_device(&heap->heap_dev);
+	return ERR_PTR(ret);
 }
 EXPORT_SYMBOL_NS_GPL(dma_heap_add, "DMA_BUF_HEAP");
 
