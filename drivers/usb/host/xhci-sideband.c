@@ -10,8 +10,11 @@
 
 #include <linux/usb/xhci-sideband.h>
 #include <linux/dma-direct.h>
+#include <linux/srcu.h>
 
 #include "xhci.h"
+
+DEFINE_STATIC_SRCU(xhci_sideband_callbacks);
 
 /* sideband internal helpers */
 static struct sg_table *
@@ -89,7 +92,7 @@ __xhci_sideband_remove_endpoint(struct xhci_sideband *sb, struct xhci_virt_ep *e
 	if (ret && ret != -ENODEV)
 		return ret;
 
-	ep->sideband = NULL;
+	rcu_assign_pointer(ep->sideband, NULL);
 	sb->eps[ep->ep_index] = NULL;
 	return 0;
 }
@@ -133,6 +136,17 @@ void xhci_sideband_notify_ep_ring_free(struct xhci_sideband *sb,
 }
 EXPORT_SYMBOL_GPL(xhci_sideband_notify_ep_ring_free);
 
+/* Protect lookup as well as callback entry against concurrent unregister. */
+void xhci_sideband_notify_ring_free(struct xhci_virt_ep *ep)
+{
+	struct xhci_sideband *sb;
+
+	guard(srcu)(&xhci_sideband_callbacks);
+	sb = srcu_dereference(ep->sideband, &xhci_sideband_callbacks);
+	if (sb)
+		xhci_sideband_notify_ep_ring_free(sb, ep->ep_index);
+}
+
 /**
  * xhci_sideband_add_endpoint - add endpoint to sideband access list
  * @sb: sideband instance for this usb device
@@ -171,11 +185,11 @@ xhci_sideband_add_endpoint(struct xhci_sideband *sb,
 	 * and let this function add the endpoint and allocate the ring buffer
 	 * with the smallest common DMA mask
 	 */
-	if (sb->eps[ep_index] || ep->sideband)
+	if (sb->eps[ep_index] || rcu_access_pointer(ep->sideband))
 		return -EBUSY;
 
-	ep->sideband = sb;
 	sb->eps[ep_index] = ep;
+	rcu_assign_pointer(ep->sideband, sb);
 
 	return 0;
 }
@@ -205,7 +219,7 @@ xhci_sideband_remove_endpoint(struct xhci_sideband *sb,
 	ep_index = xhci_get_endpoint_index(&host_ep->desc);
 	ep = sb->eps[ep_index];
 
-	if (!ep || !ep->sideband || ep->sideband != sb)
+	if (!ep || rcu_access_pointer(ep->sideband) != sb)
 		return -ENODEV;
 
 	return __xhci_sideband_remove_endpoint(sb, ep);
@@ -222,7 +236,7 @@ xhci_sideband_stop_endpoint(struct xhci_sideband *sb,
 	ep_index = xhci_get_endpoint_index(&host_ep->desc);
 	ep = sb->eps[ep_index];
 
-	if (!ep || !ep->sideband || ep->sideband != sb)
+	if (!ep || rcu_access_pointer(ep->sideband) != sb)
 		return -EINVAL;
 
 	return xhci_stop_endpoint_sync(sb->xhci, ep, 0, GFP_KERNEL);
@@ -252,7 +266,7 @@ xhci_sideband_get_endpoint_buffer(struct xhci_sideband *sb,
 	ep_index = xhci_get_endpoint_index(&host_ep->desc);
 	ep = sb->eps[ep_index];
 
-	if (!ep || !ep->ring || !ep->sideband || ep->sideband != sb)
+	if (!ep || !ep->ring || rcu_access_pointer(ep->sideband) != sb)
 		return NULL;
 
 	return xhci_ring_to_sgtable(sb, ep->ring);
@@ -484,7 +498,7 @@ xhci_sideband_unregister(struct xhci_sideband *sb)
 				xhci_warn(xhci, "Sideband endpoint %d stop failed at unregister: %d\n",
 					  i, ret);
 				/* Final unregister cannot leave a pointer to the freed sideband. */
-				sb->eps[i]->sideband = NULL;
+				rcu_assign_pointer(sb->eps[i]->sideband, NULL);
 				sb->eps[i] = NULL;
 			}
 		}
@@ -499,6 +513,8 @@ xhci_sideband_unregister(struct xhci_sideband *sb)
 	vdev->sideband = NULL;
 	spin_unlock_irq(&xhci->lock);
 
+	/* A client must not unregister from within its own ring-free callback. */
+	synchronize_srcu(&xhci_sideband_callbacks);
 	kfree(sb);
 }
 EXPORT_SYMBOL_GPL(xhci_sideband_unregister);
