@@ -2288,7 +2288,9 @@ static int snd_soc_bind_card(struct snd_soc_card *card)
 	if (ret < 0)
 		goto probe_end;
 
-	snd_soc_dapm_new_widgets(card);
+	ret = snd_soc_dapm_new_widgets(card);
+	if (ret < 0)
+		goto probe_end;
 	snd_soc_card_fixup_controls(card);
 
 	ret = snd_card_register(card->snd_card);
@@ -2892,7 +2894,8 @@ int snd_soc_add_component(struct snd_soc_component *component,
 		goto err_cleanup;
 	}
 
-	if (!component->driver->write && !component->driver->read) {
+	if (!component->driver->write && !component->driver->read &&
+	    !component->driver->read_checked) {
 		if (!component->regmap)
 			component->regmap = dev_get_regmap(component->dev,
 							   NULL);

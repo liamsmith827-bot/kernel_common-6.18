@@ -62,8 +62,11 @@ int snd_soc_get_enum_double(struct snd_kcontrol *kcontrol,
 	struct soc_enum *e = (struct soc_enum *)kcontrol->private_value;
 	unsigned int val, item;
 	unsigned int reg_val;
+	int ret;
 
-	reg_val = snd_soc_component_read(component, e->reg);
+	ret = snd_soc_component_read_checked(component, e->reg, &reg_val);
+	if (ret < 0)
+		return ret;
 	val = (reg_val >> e->shift_l) & e->mask;
 	item = snd_soc_enum_val_to_item(e, val);
 	ucontrol->value.enumerated.item[0] = item;
@@ -293,14 +296,16 @@ static int soc_get_volsw(struct snd_kcontrol *kcontrol,
 			  unsigned int, int, bool);
 	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
 	unsigned int reg_val;
-	int val;
+	int val, ret;
 
 	if (mc->sdca_q78)
 		reg_to_ctl = sdca_soc_q78_reg_to_ctl;
 	else
 		reg_to_ctl = soc_mixer_reg_to_ctl;
 
-	reg_val = snd_soc_component_read(component, mc->reg);
+	ret = snd_soc_component_read_checked(component, mc->reg, &reg_val);
+	if (ret < 0)
+		return ret;
 	val = reg_to_ctl(mc, reg_val, mask, mc->shift, max, sx);
 
 	ucontrol->value.integer.value[0] = val;
@@ -309,7 +314,9 @@ static int soc_get_volsw(struct snd_kcontrol *kcontrol,
 		if (mc->reg == mc->rreg) {
 			val = reg_to_ctl(mc, reg_val, mask, mc->rshift, max, sx);
 		} else {
-			reg_val = snd_soc_component_read(component, mc->rreg);
+			ret = snd_soc_component_read_checked(component, mc->rreg, &reg_val);
+			if (ret < 0)
+				return ret;
 			val = reg_to_ctl(mc, reg_val, mask, mc->shift, max, sx);
 		}
 

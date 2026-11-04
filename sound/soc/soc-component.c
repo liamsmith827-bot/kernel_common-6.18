@@ -721,27 +721,49 @@ int snd_soc_component_compr_get_metadata(struct snd_compr_stream *cstream,
 }
 EXPORT_SYMBOL_GPL(snd_soc_component_compr_get_metadata);
 
-static unsigned int soc_component_read_no_lock(
+static int soc_component_read_no_lock(
 	struct snd_soc_component *component,
-	unsigned int reg)
+	unsigned int reg, unsigned int *val)
 {
 	int ret;
-	unsigned int val = 0;
 
 	if (component->regmap)
-		ret = regmap_read(component->regmap, reg, &val);
+		ret = regmap_read(component->regmap, reg, val);
+	else if (component->driver->read_checked)
+		ret = component->driver->read_checked(component, reg, val);
 	else if (component->driver->read) {
 		ret = 0;
-		val = component->driver->read(component, reg);
+		*val = component->driver->read(component, reg);
 	}
 	else
 		ret = -EIO;
 
-	if (ret < 0)
-		return soc_component_ret_reg_rw(component, ret, reg);
-
-	return val;
+	return soc_component_ret_reg_rw(component, ret, reg);
 }
+
+/**
+ * snd_soc_component_read_checked() - Read a register with a separate error result
+ * @component: Component to read from
+ * @reg: Register to read
+ * @val: Destination, valid only on success
+ *
+ * Legacy driver read callbacks cannot report errors separately from data.
+ * Drivers requiring error propagation should use regmap or read_checked.
+ *
+ * Return: 0 on success, a negative error code otherwise.
+ */
+int snd_soc_component_read_checked(struct snd_soc_component *component,
+				   unsigned int reg, unsigned int *val)
+{
+	int ret;
+
+	mutex_lock(&component->io_mutex);
+	ret = soc_component_read_no_lock(component, reg, val);
+	mutex_unlock(&component->io_mutex);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(snd_soc_component_read_checked);
 
 /**
  * snd_soc_component_read() - Read register value
@@ -754,10 +776,11 @@ unsigned int snd_soc_component_read(struct snd_soc_component *component,
 				    unsigned int reg)
 {
 	unsigned int val;
+	int ret;
 
-	mutex_lock(&component->io_mutex);
-	val = soc_component_read_no_lock(component, reg);
-	mutex_unlock(&component->io_mutex);
+	ret = snd_soc_component_read_checked(component, reg, &val);
+	if (ret < 0)
+		return ret;
 
 	return val;
 }
@@ -807,13 +830,16 @@ static int snd_soc_component_update_bits_legacy(
 
 	mutex_lock(&component->io_mutex);
 
-	old = soc_component_read_no_lock(component, reg);
+	ret = soc_component_read_no_lock(component, reg, &old);
+	if (ret < 0)
+		goto out;
 
 	new = (old & ~mask) | (val & mask);
 	*change = old != new;
 	if (*change)
 		ret = soc_component_write_no_lock(component, reg, new);
 
+out:
 	mutex_unlock(&component->io_mutex);
 
 	return soc_component_ret_reg_rw(component, ret, reg);

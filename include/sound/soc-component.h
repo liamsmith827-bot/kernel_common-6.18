@@ -82,6 +82,8 @@ struct snd_soc_component_driver {
 
 	unsigned int (*read)(struct snd_soc_component *component,
 			     unsigned int reg);
+	int (*read_checked)(struct snd_soc_component *component,
+			    unsigned int reg, unsigned int *val);
 	int (*write)(struct snd_soc_component *component,
 		     unsigned int reg, unsigned int val);
 
@@ -294,6 +296,8 @@ int snd_soc_component_is_dummy(struct snd_soc_component *component);
 /* component IO */
 unsigned int snd_soc_component_read(struct snd_soc_component *component,
 				      unsigned int reg);
+int snd_soc_component_read_checked(struct snd_soc_component *component,
+				   unsigned int reg, unsigned int *val);
 int snd_soc_component_write(struct snd_soc_component *component,
 			    unsigned int reg, unsigned int val);
 int snd_soc_component_update_bits(struct snd_soc_component *component,
