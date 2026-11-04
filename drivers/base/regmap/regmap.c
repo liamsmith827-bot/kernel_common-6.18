@@ -3380,6 +3380,22 @@ static int regmap_async_is_done(struct regmap *map)
 }
 
 /**
+ * regmap_async_wait - Wait for asynchronous I/O without consuming its result.
+ * @map: Map to operate on.
+ *
+ * The caller must exclude new asynchronous submissions while waiting if it
+ * needs to keep the bus idle afterwards. This does not acquire the map lock,
+ * so a caller supplying its own regmap lock may hold that lock across the wait.
+ * The I/O owner must still use regmap_async_complete() to collect any error.
+ */
+void regmap_async_wait(struct regmap *map)
+{
+	if (map->bus && map->bus->async_write)
+		wait_event(map->async_waitq, regmap_async_is_done(map));
+}
+EXPORT_SYMBOL_GPL(regmap_async_wait);
+
+/**
  * regmap_async_complete - Ensure all asynchronous I/O has completed.
  *
  * @map: Map to operate on.

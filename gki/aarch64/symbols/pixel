@@ -2282,6 +2282,7 @@
   register_virtio_device
   __register_virtio_driver
   regmap_async_complete
+  regmap_async_wait
   regmap_bulk_read
   regmap_bulk_write
   regmap_check_range_table
